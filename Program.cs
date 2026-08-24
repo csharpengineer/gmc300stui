@@ -27,13 +27,18 @@ internal static class Program
             return 2;
         }
 
+        var classic = args.Any(a => string.Equals(a, "--classic", StringComparison.OrdinalIgnoreCase));
+
         try
         {
             using var device = new Gmc300sDevice(portName, baudRate);
             device.Open();
 
-            var app = new TuiApp(device);
-            app.Run();
+            if (classic)
+                new TuiApp(device).Run();
+            else
+                new ResponsiveTuiApp(device).Run();
+
             return 0;
         }
         catch (Exception ex)
@@ -75,8 +80,9 @@ internal static class Program
         Console.WriteLine("GMC-300S Windows TUI");
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  gmc300s-tui.exe [--port COM10] [--baud 57600]");
+        Console.WriteLine("  gmc300s-tui.exe [--port COM10] [--baud 57600] [--classic]");
         Console.WriteLine();
         Console.WriteLine("Defaults are COM10 and 57600 baud.");
+        Console.WriteLine("The responsive colored UI is the default; --classic runs the original compact UI.");
     }
 }
