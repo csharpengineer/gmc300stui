@@ -25,6 +25,7 @@ public sealed class TuiApp
         public double? Voltage { get; set; }
         public double? TemperatureC { get; set; }
         public DateTime? DeviceTime { get; set; }
+        public double? ClockDriftSeconds { get; set; }
         public (short X, short Y, short Z)? Gyro { get; set; }
         public byte[]? Config { get; set; }
         public string? Version { get; set; }
@@ -34,9 +35,7 @@ public sealed class TuiApp
         public DateTime LastSlowPollAt { get; set; }
         public DateTime LastConfigAt { get; set; }
         public Queue<int> CpmHistory { get; } = new();
-        public bool CpsSupported { get; set; } = true;
-        public bool TempSupported { get; set; } = true;
-        public bool GyroSupported { get; set; } = true;
+        public DeviceCapabilities Capabilities { get; set; } = DeviceCapabilities.Unknown;
     }
 
     private readonly Gmc300sDevice _device;
@@ -128,10 +127,13 @@ public sealed class TuiApp
                 _snapshot.Version = version;
                 _snapshot.Serial = serial;
                 _snapshot.Config = config;
+                _snapshot.Capabilities = DeviceCapabilities.FromVersion(version);
                 _snapshot.Cpm = cpm;
                 _snapshot.LastCpmAt = DateTime.Now;
                 _snapshot.LastConfigAt = DateTime.Now;
-                _snapshot.CpmHistory.Enqueue(cpm);
+                // Treat the immediate connection reading as a warm-up value. The
+                // rolling graph starts with the first regular poll so a transient
+                // zero at connect time does not become the chart minimum.
                 _snapshot.Status = "Connected";
             }
         }
@@ -153,7 +155,7 @@ public sealed class TuiApp
                     _snapshot.Cpm = cpm;
                     _snapshot.LastCpmAt = DateTime.Now;
                     _snapshot.CpmHistory.Enqueue(cpm);
-                    while (_snapshot.CpmHistory.Count > 120)
+                    while (_snapshot.CpmHistory.Count > 60)
                         _snapshot.CpmHistory.Dequeue();
                     _snapshot.Status = "Connected";
                 }
@@ -185,60 +187,42 @@ public sealed class TuiApp
 
     private void PollSlow()
     {
-        bool tryCps;
-        lock (_snapshotLock) tryCps = _snapshot.CpsSupported;
-        if (tryCps)
+        DeviceCapabilities capabilities;
+        lock (_snapshotLock) capabilities = _snapshot.Capabilities;
+
+        // Heartbeat continuously injects CPS bytes into the serial stream. The TUI
+        // intentionally keeps it disabled while using command/response polling so
+        // those bytes cannot contaminate replies. Only sample it for a model that
+        // explicitly opts in through the capability table.
+        if (capabilities.HeartbeatCpsSampling)
         {
             try
             {
                 var cps = _device.GetCpsViaHeartbeatSample();
                 lock (_snapshotLock) _snapshot.Cps = cps;
             }
-            catch (TimeoutException)
-            {
-                lock (_snapshotLock) _snapshot.CpsSupported = false;
-            }
             catch { }
         }
 
         TryUpdate(() => _device.GetVoltage(), v => _snapshot.Voltage = v);
-        TryUpdate(() => _device.GetDateTime(), v => _snapshot.DeviceTime = v);
 
-        bool tryTemp;
-        bool tryGyro;
-        lock (_snapshotLock)
+        try
         {
-            tryTemp = _snapshot.TempSupported;
-            tryGyro = _snapshot.GyroSupported;
+            var deviceTime = _device.GetDateTime();
+            var sampledAt = DateTime.Now;
+            lock (_snapshotLock)
+            {
+                _snapshot.DeviceTime = deviceTime;
+                _snapshot.ClockDriftSeconds = (deviceTime - sampledAt).TotalSeconds;
+            }
         }
+        catch { }
 
-        if (tryTemp)
-        {
-            try
-            {
-                var temp = _device.GetTemperatureCelsius();
-                lock (_snapshotLock) _snapshot.TemperatureC = temp;
-            }
-            catch (TimeoutException)
-            {
-                lock (_snapshotLock) _snapshot.TempSupported = false;
-            }
-            catch { }
-        }
+        if (capabilities.Temperature)
+            TryUpdate(() => _device.GetTemperatureCelsius(), v => _snapshot.TemperatureC = v);
 
-        if (tryGyro)
-        {
-            try
-            {
-                var gyro = _device.GetGyro();
-                lock (_snapshotLock) _snapshot.Gyro = gyro;
-            }
-            catch (TimeoutException)
-            {
-                lock (_snapshotLock) _snapshot.GyroSupported = false;
-            }
-            catch { }
-        }
+        if (capabilities.Gyroscope)
+            TryUpdate(() => _device.GetGyro(), v => _snapshot.Gyro = v);
     }
 
     private void PollConfig()
@@ -698,8 +682,13 @@ public sealed class TuiApp
         var s = CopySnapshot();
         var config = s.Config;
         var dose = "n/a";
+        var calibration = "n/a";
         if (s.Cpm is int cpm && config is not null && ConfigSettings.TryComputeDoseRate(config, cpm, out var uSv))
+        {
             dose = $"{uSv:0.0000} µSv/h   (~{uSv / 10.0:0.0000} mR/h)";
+            if (uSv > 0)
+                calibration = $"~{cpm / uSv:0.0} CPM per µSv/h";
+        }
 
         var speaker = config is { Length: > 2 } ? (config[2] == 0 ? "OFF" : "ON") : "?";
         var alarm = config is { Length: > 1 } ? (config[1] == 0 ? "OFF" : "ON") : "?";
@@ -707,21 +696,38 @@ public sealed class TuiApp
             ? ConfigSettings.FormatValue(ConfigSettings.All.First(x => x.Offset == 32), config)
             : "?";
 
+        var cps = s.Capabilities.HeartbeatCpsSampling
+            ? (s.Cps?.ToString("N0", CultureInfo.InvariantCulture) ?? "waiting...")
+            : "N/A (heartbeat disabled during command polling)";
+        var temperature = s.Capabilities.Temperature
+            ? (s.TemperatureC is null ? "waiting..." : $"{s.TemperatureC:0.0} °C")
+            : $"Unsupported on {s.Capabilities.Model}";
+        var gyro = s.Capabilities.Gyroscope
+            ? (s.Gyro is null ? "waiting..." : $"X={s.Gyro.Value.X}  Y={s.Gyro.Value.Y}  Z={s.Gyro.Value.Z}")
+            : $"Unsupported on {s.Capabilities.Model}";
+        var clock = s.DeviceTime is null
+            ? "n/a"
+            : $"{s.DeviceTime.Value:yyyy-MM-dd HH:mm:ss}{FormatClockDrift(s.ClockDriftSeconds)}";
+
         sb.AppendLine();
+        sb.AppendLine("  RADIATION");
         sb.AppendLine($"  CPM                 {FormatNullable(s.Cpm),12}");
-        sb.AppendLine($"  CPS (heartbeat)     {(s.Cps is null ? (s.CpsSupported ? "probing..." : "unsupported") : s.Cps.Value.ToString("N0", CultureInfo.InvariantCulture))}");
+        sb.AppendLine($"  CPS                 {cps}");
         sb.AppendLine($"  Dose rate           {dose}");
+        sb.AppendLine($"  Calibration         {calibration}");
+        sb.AppendLine();
+        sb.AppendLine("  DEVICE");
         sb.AppendLine($"  Battery voltage     {(s.Voltage is null ? "n/a" : $"{s.Voltage:0.0} V")}");
-        sb.AppendLine($"  Temperature         {(s.TemperatureC is null ? (s.TempSupported ? "probing..." : "unsupported") : $"{s.TemperatureC:0.0} °C")}");
-        sb.AppendLine($"  Device clock        {(s.DeviceTime is null ? "n/a" : s.DeviceTime.Value.ToString("yyyy-MM-dd HH:mm:ss"))}");
-        sb.AppendLine($"  Gyro/orientation    {(s.Gyro is null ? (s.GyroSupported ? "probing..." : "unsupported") : $"X={s.Gyro.Value.X}  Y={s.Gyro.Value.Y}  Z={s.Gyro.Value.Z}")}");
+        sb.AppendLine($"  Device clock        {clock}");
+        sb.AppendLine($"  Temperature         {temperature}");
+        sb.AppendLine($"  Gyro/orientation    {gyro}");
         sb.AppendLine($"  Speaker/clicks      {speaker}");
         sb.AppendLine($"  Alarm               {alarm}");
         sb.AppendLine($"  Data logging        {saveMode}");
         sb.AppendLine($"  Serial number       {s.Serial ?? "n/a"}");
         sb.AppendLine();
-        sb.AppendLine("  CPM history (newest at right)");
-        sb.AppendLine("  " + Sparkline(s.CpmHistory, Math.Min(90, Math.Max(20, width - 6))));
+        sb.AppendLine("  CPM history · last 60 regular samples (~1 minute)");
+        sb.AppendLine("  " + Sparkline(s.CpmHistory, Math.Min(60, Math.Max(20, width - 6))));
         sb.AppendLine();
         sb.AppendLine("  M mute/unmute   A alarm toggle   T sync device clock   R remote keypad");
         sb.AppendLine("  S settings      H history        I raw/info            X advanced");
@@ -798,6 +804,7 @@ public sealed class TuiApp
         var s = CopySnapshot();
         sb.AppendLine($" INFO / RAW CONFIG     Version: {s.Version ?? "?"}     Serial: {s.Serial ?? "?"}");
         sb.AppendLine($" Connection: {_device.PortName} @ {_device.BaudRate}, 8 data bits, no parity, 1 stop bit, no flow control");
+        sb.AppendLine($" Model capabilities: heartbeat CPS={(s.Capabilities.HeartbeatCpsSampling ? "sampled" : "disabled")}, temperature={(s.Capabilities.Temperature ? "yes" : "no")}, gyro={(s.Capabilities.Gyroscope ? "yes" : "no")}");
         sb.AppendLine($" Raw configuration page {_rawConfigPage + 1}/2 — ←/→ change page, R refresh");
         sb.AppendLine(new string('─', Math.Min(width - 1, 140)));
 
@@ -886,15 +893,14 @@ public sealed class TuiApp
         double? Voltage,
         double? TemperatureC,
         DateTime? DeviceTime,
+        double? ClockDriftSeconds,
         (short X, short Y, short Z)? Gyro,
         byte[]? Config,
         string? Version,
         string? Serial,
         string Status,
         int[] CpmHistory,
-        bool CpsSupported,
-        bool TempSupported,
-        bool GyroSupported);
+        DeviceCapabilities Capabilities);
 
     private SnapshotCopy CopySnapshot()
     {
@@ -906,15 +912,14 @@ public sealed class TuiApp
                 _snapshot.Voltage,
                 _snapshot.TemperatureC,
                 _snapshot.DeviceTime,
+                _snapshot.ClockDriftSeconds,
                 _snapshot.Gyro,
                 _snapshot.Config?.ToArray(),
                 _snapshot.Version,
                 _snapshot.Serial,
                 _snapshot.Status,
                 _snapshot.CpmHistory.ToArray(),
-                _snapshot.CpsSupported,
-                _snapshot.TempSupported,
-                _snapshot.GyroSupported);
+                _snapshot.Capabilities);
         }
     }
 
@@ -925,14 +930,25 @@ public sealed class TuiApp
         const string bars = "▁▂▃▄▅▆▇█";
         var min = data.Min();
         var max = data.Max();
-        if (max == min) return new string(bars[3], data.Length) + $"  {min} CPM";
+        var average = data.Average();
+        if (max == min)
+            return new string(bars[3], data.Length) + $"  min {min} / avg {average:0.0} / max {max}";
 
         var chars = data.Select(v =>
         {
             var idx = (int)Math.Round((v - min) * (bars.Length - 1.0) / (max - min));
             return bars[Math.Clamp(idx, 0, bars.Length - 1)];
         }).ToArray();
-        return new string(chars) + $"  min {min} / max {max}";
+        return new string(chars) + $"  min {min} / avg {average:0.0} / max {max}";
+    }
+
+    private static string FormatClockDrift(double? driftSeconds)
+    {
+        if (driftSeconds is null)
+            return string.Empty;
+
+        var rounded = (int)Math.Round(driftSeconds.Value);
+        return $"  ({rounded:+#;-#;0} s vs PC)";
     }
 
     private static string FormatNullable(int? value) => value?.ToString("N0", CultureInfo.InvariantCulture) ?? "n/a";
