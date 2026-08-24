@@ -21,6 +21,13 @@ public sealed class ResponsiveTuiApp
         Help
     }
 
+    private enum GraphMetric
+    {
+        Cpm,
+        Dose,
+        Battery
+    }
+
     private sealed class Snapshot
     {
         public int? Cpm { get; set; }
@@ -38,6 +45,7 @@ public sealed class ResponsiveTuiApp
         public DateTime LastSlowPollAt { get; set; }
         public DateTime LastConfigAt { get; set; }
         public Queue<int> CpmHistory { get; } = new();
+        public Queue<int> VoltageHistoryMv { get; } = new();
         public DeviceCapabilities Capabilities { get; set; } = DeviceCapabilities.Unknown;
     }
 
@@ -48,6 +56,7 @@ public sealed class ResponsiveTuiApp
     private readonly string _backupDirectory;
     private readonly string _historyDirectory;
     private Screen _screen = Screen.Dashboard;
+    private GraphMetric _graphMetric = GraphMetric.Cpm;
     private int _settingIndex;
     private int _rawConfigPage;
     private string _message = string.Empty;
@@ -203,7 +212,19 @@ public sealed class ResponsiveTuiApp
             catch { }
         }
 
-        TryUpdate(() => _device.GetVoltage(), v => _snapshot.Voltage = v);
+        try
+        {
+            var voltage = _device.GetVoltage();
+            lock (_snapshotLock)
+            {
+                _snapshot.Voltage = voltage;
+                _snapshot.VoltageHistoryMv.Enqueue((int)Math.Round(voltage * 1000.0));
+                // One hour at the five-second slow-poll cadence.
+                while (_snapshot.VoltageHistoryMv.Count > 720)
+                    _snapshot.VoltageHistoryMv.Dequeue();
+            }
+        }
+        catch { }
 
         try
         {
@@ -258,6 +279,7 @@ public sealed class ResponsiveTuiApp
             case ConsoleKey.I: _screen = Screen.Info; return true;
             case ConsoleKey.X: _screen = Screen.Advanced; return true;
             case ConsoleKey.F1: _screen = Screen.Help; return true;
+            case ConsoleKey.G when _screen == Screen.Dashboard: CycleGraphMetric(); return true;
             case ConsoleKey.M: ToggleSpeaker(); return true;
             case ConsoleKey.A: ToggleAlarm(); return true;
             case ConsoleKey.T: SyncClock(); return true;
@@ -423,6 +445,18 @@ public sealed class ResponsiveTuiApp
             Flash("Advanced command failed: " + ex.Message, 6);
         }
         return true;
+    }
+
+    private void CycleGraphMetric()
+    {
+        _graphMetric = _graphMetric switch
+        {
+            GraphMetric.Cpm => GraphMetric.Dose,
+            GraphMetric.Dose => GraphMetric.Battery,
+            _ => GraphMetric.Cpm
+        };
+        GraphGraphics.InvalidateSixelOverlay();
+        Flash($"Graph: {_graphMetric switch { GraphMetric.Cpm => "CPM", GraphMetric.Dose => "dose (nSv/h)", _ => "battery (mV)" }}");
     }
 
     private void ToggleSpeaker()
@@ -705,6 +739,7 @@ public sealed class ResponsiveTuiApp
         var y = lineY + 2;
         var x = 1;
         x = WriteHotkey(c, x, y, "D", "Dashboard");
+        if (_screen == Screen.Dashboard && x < c.Width - 12) x = WriteHotkey(c, x, y, "G", "Graph");
         x = WriteHotkey(c, x, y, "S", "Settings");
         x = WriteHotkey(c, x, y, "R", "Remote");
         x = WriteHotkey(c, x, y, "H", "History");
@@ -749,7 +784,7 @@ public sealed class ResponsiveTuiApp
 
         var graphY = bodyTop + panelH + 1;
         var graphH = bodyBottom - graphY + 1;
-        DrawCpmGraph(c, 1, graphY, c.Width - 2, graphH, s.CpmHistory);
+        DrawSelectedGraph(c, 1, graphY, c.Width - 2, graphH, s);
     }
 
     private void DrawCompactDashboard(ConsoleCanvas c, SnapshotCopy s, int top, int bottom)
@@ -779,9 +814,12 @@ public sealed class ResponsiveTuiApp
         row++;
         var graphH = bottom - row + 1;
         if (graphH >= 6)
-            DrawCpmGraph(c, 1, row, c.Width - 2, graphH, s.CpmHistory);
+            DrawSelectedGraph(c, 1, row, c.Width - 2, graphH, s);
         else if (graphH >= 2)
-            DrawMiniGraph(c, 2, row, c.Width - 4, s.CpmHistory);
+        {
+            var series = GetSelectedGraphSeries(s);
+            DrawMiniGraph(c, 2, row, c.Width - 4, series.Data, series.ShortLabel);
+        }
     }
 
     private void DrawRadiationPanel(ConsoleCanvas c, SnapshotCopy s, int x, int y, int width, int height, bool large)
@@ -848,15 +886,46 @@ public sealed class ResponsiveTuiApp
         c.Write(x + 18, y, value, valueColor, maxWidth: Math.Max(1, c.Width - x - 19));
     }
 
-    private void DrawCpmGraph(ConsoleCanvas c, int x, int y, int width, int height, IReadOnlyList<int> history)
+    private void DrawSelectedGraph(ConsoleCanvas c, int x, int y, int width, int height, SnapshotCopy snapshot)
+    {
+        var series = GetSelectedGraphSeries(snapshot);
+        DrawTrendGraph(c, x, y, width, height, series.Data, series.Title, series.ShortLabel, series.SecondsPerSample);
+    }
+
+    private (int[] Data, string Title, string ShortLabel, int SecondsPerSample) GetSelectedGraphSeries(SnapshotCopy snapshot)
+    {
+        switch (_graphMetric)
+        {
+            case GraphMetric.Dose:
+            {
+                if (snapshot.Config is null)
+                    return ([], "DOSE TREND · nSv/h", "Dose", 1);
+
+                var dose = new List<int>(snapshot.CpmHistory.Length);
+                foreach (var cpm in snapshot.CpmHistory)
+                {
+                    if (ConfigSettings.TryComputeDoseRate(snapshot.Config, cpm, out var uSv))
+                        dose.Add((int)Math.Round(uSv * 1000.0, MidpointRounding.AwayFromZero));
+                }
+                return (dose.ToArray(), "DOSE TREND · nSv/h", "Dose", 1);
+            }
+            case GraphMetric.Battery:
+                return (snapshot.VoltageHistoryMv, "BATTERY TREND · mV", "Battery", 5);
+            default:
+                return (snapshot.CpmHistory, "CPM TREND", "CPM", 1);
+        }
+    }
+
+    private static void DrawTrendGraph(ConsoleCanvas c, int x, int y, int width, int height,
+        IReadOnlyList<int> history, string title, string shortLabel, int secondsPerSample)
     {
         if (width < 24 || height < 6)
         {
-            DrawMiniGraph(c, x, y, width, history);
+            DrawMiniGraph(c, x, y, width, history, shortLabel);
             return;
         }
 
-        c.Box(x, y, width, height, ConsoleColor.DarkGray, "CPM TREND", ConsoleColor.Cyan);
+        c.Box(x, y, width, height, ConsoleColor.DarkGray, title, ConsoleColor.Cyan);
         var axisW = 7;
         var plotX = x + axisW;
         var plotY = y + 2;
@@ -866,7 +935,7 @@ public sealed class ResponsiveTuiApp
 
         if (data.Length == 0)
         {
-            c.Write(x + 3, y + 2, "Waiting for regular CPM samples...", ConsoleColor.DarkGray);
+            c.Write(x + 3, y + 2, $"Waiting for {shortLabel.ToLowerInvariant()} samples...", ConsoleColor.DarkGray);
             return;
         }
 
@@ -885,9 +954,9 @@ public sealed class ResponsiveTuiApp
         var topValue = scaleMax;
         var midValue = (scaleMax + scaleMin) / 2;
         var bottomValue = scaleMin;
-        DrawGridLine(c, x, plotX, plotY, plotW, topValue, ConsoleColor.DarkGray);
-        DrawGridLine(c, x, plotX, plotY + plotH / 2, plotW, midValue, ConsoleColor.DarkGray);
-        DrawGridLine(c, x, plotX, plotY + plotH - 1, plotW, bottomValue, ConsoleColor.DarkGray);
+        DrawGridLine(c, plotX, plotY, plotW, topValue, ConsoleColor.DarkGray);
+        DrawGridLine(c, plotX, plotY + plotH / 2, plotW, midValue, ConsoleColor.DarkGray);
+        DrawGridLine(c, plotX, plotY + plotH - 1, plotW, bottomValue, ConsoleColor.DarkGray);
 
         var avgY = ValueToRow(average, scaleMin, scaleMax, plotY, plotH);
         for (var px = plotX; px < plotX + plotW; px += 2)
@@ -911,13 +980,13 @@ public sealed class ResponsiveTuiApp
         }
 
         var bottomY = y + height - 2;
-        var approxSeconds = data.Length;
+        var approxSeconds = Math.Max(secondsPerSample, data.Length * secondsPerSample);
         c.Write(plotX, bottomY, approxSeconds < 90 ? $"~{approxSeconds}s ago" : $"~{approxSeconds / 60.0:0.0}m ago", ConsoleColor.DarkGray);
         c.WriteRight(x + width - 3, bottomY, "now", ConsoleColor.DarkGray);
         c.Write(plotX + Math.Max(1, plotW / 2 - 4), bottomY, $"avg {average:0.0}", ConsoleColor.DarkYellow);
     }
 
-    private static void DrawGridLine(ConsoleCanvas c, int boxX, int plotX, int y, int plotW, int value, ConsoleColor color)
+    private static void DrawGridLine(ConsoleCanvas c, int plotX, int y, int plotW, int value, ConsoleColor color)
     {
         c.WriteRight(plotX - 2, y, value.ToString(CultureInfo.InvariantCulture), ConsoleColor.DarkGray);
         for (var px = plotX; px < plotX + plotW; px += 2)
@@ -949,25 +1018,25 @@ public sealed class ResponsiveTuiApp
 
         var start = Math.Min(y1, y2) + 1;
         var end = Math.Max(y1, y2);
-        for (var y = start; y < end; y++)
-            c.Put(x2, y, '│', color);
+        for (var graphY = start; graphY < end; graphY++)
+            c.Put(x2, graphY, '│', color);
         c.Put(x2, y2, delta < 0 ? '╱' : '╲', color);
     }
 
-    private static void DrawMiniGraph(ConsoleCanvas c, int x, int y, int width, IReadOnlyList<int> history)
+    private static void DrawMiniGraph(ConsoleCanvas c, int x, int y, int width, IReadOnlyList<int> history, string label)
     {
-        var data = history.TakeLast(Math.Max(1, width - 2)).ToArray();
+        var data = history.TakeLast(Math.Max(1, width - label.Length - 2)).ToArray();
         if (data.Length == 0)
         {
-            c.Write(x, y, "CPM history: waiting for samples...", ConsoleColor.DarkGray);
+            c.Write(x, y, $"{label} history: waiting for samples...", ConsoleColor.DarkGray);
             return;
         }
 
         const string bars = "▁▂▃▄▅▆▇█";
         var min = data.Min();
         var max = data.Max();
-        c.Write(x, y, "CPM ", ConsoleColor.Cyan);
-        var graphX = x + 4;
+        c.Write(x, y, label + " ", ConsoleColor.Cyan);
+        var graphX = x + label.Length + 1;
         for (var i = 0; i < data.Length && graphX + i < c.Width; i++)
         {
             var idx = max == min ? 3 : (int)Math.Round((data[i] - min) * (bars.Length - 1.0) / (max - min));
@@ -1145,6 +1214,7 @@ public sealed class ResponsiveTuiApp
         DrawHelpRow(c, ref y, "H", "History/export");
         DrawHelpRow(c, ref y, "I", "Device info/raw configuration");
         DrawHelpRow(c, ref y, "X", "Advanced commands");
+        DrawHelpRow(c, ref y, "G", "Cycle dashboard graph: CPM / dose / battery");
         DrawHelpRow(c, ref y, "M", "Mute/unmute speaker clicks");
         DrawHelpRow(c, ref y, "A", "Toggle alarm");
         DrawHelpRow(c, ref y, "T", "Synchronize counter clock to Windows");
@@ -1270,6 +1340,7 @@ public sealed class ResponsiveTuiApp
         string? Serial,
         string Status,
         int[] CpmHistory,
+        int[] VoltageHistoryMv,
         DeviceCapabilities Capabilities);
 
     private SnapshotCopy CopySnapshot()
@@ -1289,6 +1360,7 @@ public sealed class ResponsiveTuiApp
                 _snapshot.Serial,
                 _snapshot.Status,
                 _snapshot.CpmHistory.ToArray(),
+                _snapshot.VoltageHistoryMv.ToArray(),
                 _snapshot.Capabilities);
         }
     }

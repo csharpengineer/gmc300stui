@@ -47,6 +47,9 @@ internal static class GraphGraphics
     private static (int Width, int Height)? _cellSize;
     private static bool _sixelFailed;
     private static ulong? _lastSixelSignature;
+    private static (byte R, byte G, byte B) _terminalBackground = (0, 0, 0);
+    private static DateTime _lastBackgroundProbeUtc = DateTime.MinValue;
+    private static readonly TimeSpan BackgroundProbeInterval = TimeSpan.FromSeconds(30);
 
     public static GraphGraphicsMode Requested => _requested;
 
@@ -91,6 +94,8 @@ internal static class GraphGraphics
         _cellSize = null;
         _sixelFailed = false;
         _lastSixelSignature = null;
+        _terminalBackground = (0, 0, 0);
+        _lastBackgroundProbeUtc = DateTime.MinValue;
         return true;
     }
 
@@ -225,7 +230,119 @@ internal static class GraphGraphics
         if (!UseSixel || points.Count < 2 || frame.PlotWidth < 1 || frame.PlotHeight < 1)
             return false;
 
+        if (RefreshTerminalBackgroundIfDue())
+            _lastSixelSignature = null;
+
         return _lastSixelSignature != ComputeSixelSignature(points, frame);
+    }
+
+    private static bool RefreshTerminalBackgroundIfDue()
+    {
+        if (!UseSixel || Console.IsInputRedirected || Console.IsOutputRedirected)
+            return false;
+
+        var now = DateTime.UtcNow;
+        if (now - _lastBackgroundProbeUtc < BackgroundProbeInterval)
+            return false;
+
+        // Set the attempt time before querying so an unsupported terminal costs at
+        // most one short timeout every 30 seconds rather than every render frame.
+        _lastBackgroundProbeUtc = now;
+        if (!TryQueryTerminalBackground(out var background))
+            return false;
+
+        if (background == _terminalBackground)
+            return false;
+
+        _terminalBackground = background;
+        return true;
+    }
+
+    private static bool TryQueryTerminalBackground(out (byte R, byte G, byte B) color)
+    {
+        color = default;
+        try
+        {
+            // OSC 11 asks for the terminal's default background color. A typical
+            // reply is ESC ] 11 ; rgb:0c0c/0c0c/0c0c ESC \\ .
+            if (Console.KeyAvailable)
+                return false;
+
+            Console.Write("\u001b]11;?\u0007");
+            Console.Out.Flush();
+
+            var response = new StringBuilder(96);
+            var stopwatch = Stopwatch.StartNew();
+            var started = false;
+            var previous = '\0';
+
+            while (stopwatch.ElapsedMilliseconds < 140)
+            {
+                if (!Console.KeyAvailable)
+                {
+                    Thread.Sleep(2);
+                    continue;
+                }
+
+                var ch = Console.ReadKey(intercept: true).KeyChar;
+                if (!started)
+                {
+                    if (ch != '\u001b')
+                        continue;
+                    started = true;
+                }
+
+                response.Append(ch);
+                if (ch == '\u0007' || (previous == '\u001b' && ch == '\\') || response.Length >= 95)
+                    break;
+                previous = ch;
+            }
+
+            return TryParseOsc11Background(response.ToString(), out color);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryParseOsc11Background(string response, out (byte R, byte G, byte B) color)
+    {
+        color = default;
+        const string marker = "]11;rgb:";
+        var markerAt = response.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (markerAt < 0)
+            return false;
+
+        var start = markerAt + marker.Length;
+        var end = response.IndexOf('\u0007', start);
+        var st = response.IndexOf("\u001b\\", start, StringComparison.Ordinal);
+        if (end < 0 || (st >= 0 && st < end)) end = st;
+        if (end < 0) end = response.Length;
+
+        var parts = response[start..end].Split('/');
+        if (parts.Length != 3 ||
+            !TryParseOscColorComponent(parts[0], out var r) ||
+            !TryParseOscColorComponent(parts[1], out var g) ||
+            !TryParseOscColorComponent(parts[2], out var b))
+            return false;
+
+        color = (r, g, b);
+        return true;
+    }
+
+    private static bool TryParseOscColorComponent(string hex, out byte value)
+    {
+        value = 0;
+        hex = hex.Trim();
+        if (hex.Length is < 1 or > 4 ||
+            !uint.TryParse(hex, System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsed))
+            return false;
+
+        var max = (1u << (hex.Length * 4)) - 1u;
+        value = (byte)Math.Round(parsed * 255.0 / max, MidpointRounding.AwayFromZero);
+        return true;
     }
 
     public static void BeginSynchronizedUpdate()
@@ -255,6 +372,7 @@ internal static class GraphGraphics
 
         try
         {
+            RefreshTerminalBackgroundIfDue();
             var signature = ComputeSixelSignature(points, frame);
             var cellSize = EffectiveCellSize();
             var cellW = Math.Clamp(cellSize.Width, 4, 32);
@@ -263,7 +381,7 @@ internal static class GraphGraphics
             var pixelHeight = Math.Max(1, frame.PlotHeight * cellH);
 
             // Palette indexes:
-            // 0 black background, 1 cyan trace, 2 yellow current point,
+            // 0 terminal default background, 1 cyan trace, 2 yellow current point,
             // 3 dark-gray scale grid, 4 dark-yellow average line.
             var pixels = new byte[pixelHeight, pixelWidth];
 
@@ -304,7 +422,7 @@ internal static class GraphGraphics
             var latest = ToPixel(points[^1]);
             DrawDisc(pixels, latest.X, latest.Y, Math.Max(2, cellH / 8), 2);
 
-            var payload = EncodeOpaqueSixel(pixels);
+            var payload = EncodeOpaqueSixel(pixels, _terminalBackground);
             if (payload.Length == 0)
                 return false;
 
@@ -409,6 +527,9 @@ internal static class GraphGraphics
         Mix(BitConverter.DoubleToInt64Bits(frame.Average).GetHashCode());
         Mix(cell.Width);
         Mix(cell.Height);
+        Mix(_terminalBackground.R);
+        Mix(_terminalBackground.G);
+        Mix(_terminalBackground.B);
         Mix(points.Count);
         foreach (var point in points)
         {
@@ -463,7 +584,7 @@ internal static class GraphGraphics
         pixels[y, x] = color;
     }
 
-    private static string EncodeOpaqueSixel(byte[,] pixels)
+    private static string EncodeOpaqueSixel(byte[,] pixels, (byte R, byte G, byte B) background)
     {
         var height = pixels.GetLength(0);
         var width = pixels.GetLength(1);
@@ -473,7 +594,10 @@ internal static class GraphGraphics
         var sb = new StringBuilder(Math.Min(width * Math.Max(1, height / 2), 2_000_000));
         sb.Append("\u001bP0;0;0q");             // P2=0: opaque replacement
         sb.Append('"').Append("1;1;").Append(width).Append(';').Append(height);
-        sb.Append("#0;2;0;0;0");                // black background
+        sb.Append("#0;2;")
+            .Append(ToSixelPercent(background.R)).Append(';')
+            .Append(ToSixelPercent(background.G)).Append(';')
+            .Append(ToSixelPercent(background.B)); // terminal background (OSC 11)
         sb.Append("#1;2;35;85;85");            // cyan trace
         sb.Append("#2;2;100;96;62");           // yellow current point
         sb.Append("#3;2;30;32;34");            // dark gray grid
@@ -521,6 +645,9 @@ internal static class GraphGraphics
         sb.Append("\u001b\\");
         return sb.ToString();
     }
+
+    private static int ToSixelPercent(byte value) =>
+        (int)Math.Round(value * 100.0 / 255.0, MidpointRounding.AwayFromZero);
 
     private static void AppendRleSixels(StringBuilder sb, byte[] masks, int count)
     {
