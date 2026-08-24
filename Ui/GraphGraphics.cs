@@ -14,9 +14,8 @@ internal readonly record struct SixelGraphPoint(int SubX, int SubY, ConsoleColor
 
 /// <summary>
 /// Chooses the highest-quality graph backend the current terminal can support.
-/// Auto mode is deliberately conservative: Sixel is enabled only when the host
-/// is known to support it and we can determine the console cell size. Otherwise
-/// the existing Unicode Braille renderer remains the fallback.
+/// Known Sixel-capable hosts are allowed to use a conservative cell-size fallback
+/// when legacy console font metrics are unavailable (as is normal under ConPTY).
 /// </summary>
 internal static class GraphGraphics
 {
@@ -24,6 +23,7 @@ internal static class GraphGraphics
     private static GraphGraphicsMode? _resolved;
     private static (int Width, int Height)? _cellSize;
     private static bool _sixelFailed;
+    private static ulong? _lastSixelSignature;
 
     public static GraphGraphicsMode Requested => _requested;
 
@@ -67,6 +67,7 @@ internal static class GraphGraphics
         _resolved = null;
         _cellSize = null;
         _sixelFailed = false;
+        _lastSixelSignature = null;
         return true;
     }
 
@@ -80,36 +81,79 @@ internal static class GraphGraphics
 
         if (_requested == GraphGraphicsMode.Sixel)
         {
-            _cellSize = TryGetConsoleCellSize(out var forcedSize) ? forcedSize : (8, 16);
+            _cellSize = TryGetConsoleCellSize(out var forcedSize) ? forcedSize : DefaultCellSize();
             return GraphGraphicsMode.Sixel;
         }
 
         if (!IsSixelLikelySupported())
             return GraphGraphicsMode.Braille;
 
-        if (!TryGetConsoleCellSize(out var size))
-            return GraphGraphicsMode.Braille;
-
-        _cellSize = size;
+        // GetCurrentConsoleFontEx commonly fails when stdout is a Windows Terminal
+        // ConPTY handle rather than a legacy console screen-buffer handle. That is
+        // not evidence that Sixel is unsupported, so known-Sixel hosts use a sane
+        // fallback instead of incorrectly dropping to Braille.
+        _cellSize = TryGetConsoleCellSize(out var size) ? size : DefaultCellSize();
         return GraphGraphicsMode.Sixel;
     }
 
     private static bool IsSixelLikelySupported()
     {
-        // Windows Terminal 1.22+ and current conhost support Sixel. WT_SESSION is
-        // a reliable marker that the process is running under Windows Terminal.
-        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("WT_SESSION")))
-            return true;
-
-        // A few common Unix terminal environments advertise Sixel explicitly.
-        // Until the Linux port grows a cell-metrics query, auto mode will still
-        // fall back to Braille there because TryGetConsoleCellSize returns false.
-        var term = Environment.GetEnvironmentVariable("TERM") ?? string.Empty;
-        if (term.Contains("sixel", StringComparison.OrdinalIgnoreCase))
+        // Windows Terminal exports WT_SESSION. WT_PROFILE_ID is included as a
+        // secondary marker for hosts/profiles where WT_SESSION is not propagated.
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("WT_SESSION")) ||
+            !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("WT_PROFILE_ID")))
             return true;
 
         var termProgram = Environment.GetEnvironmentVariable("TERM_PROGRAM") ?? string.Empty;
-        return termProgram.Equals("WezTerm", StringComparison.OrdinalIgnoreCase);
+        if (termProgram.Equals("Windows_Terminal", StringComparison.OrdinalIgnoreCase) ||
+            termProgram.Equals("WezTerm", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Unix terminals and SSH sessions sometimes advertise Sixel directly in
+        // TERM. A future capability-query backend can broaden this further.
+        var term = Environment.GetEnvironmentVariable("TERM") ?? string.Empty;
+        return term.Contains("sixel", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static (int Width, int Height) DefaultCellSize()
+    {
+        // This is intentionally only a fallback. 8x16 is a common terminal cell
+        // aspect/size and, more importantly, keeps Sixel usable under ConPTY where
+        // the Win32 font-metrics API cannot inspect the actual terminal font.
+        return (8, 16);
+    }
+
+    private static (int Width, int Height) EffectiveCellSize()
+    {
+        if (TryGetConsoleCellSize(out var live))
+        {
+            _cellSize = live;
+            return live;
+        }
+
+        return _cellSize ??= DefaultCellSize();
+    }
+
+    public static void InvalidateSixelOverlay() => _lastSixelSignature = null;
+
+    public static bool IsSixelOverlayDirty(IReadOnlyList<SixelGraphPoint> points, int topRow, int bottomRow)
+    {
+        if (!UseSixel || points.Count < 2 || bottomRow < topRow)
+            return false;
+
+        return _lastSixelSignature != ComputeSixelSignature(points, topRow, bottomRow);
+    }
+
+    public static void BeginSynchronizedUpdate()
+    {
+        if (UseSixel)
+            Console.Write("\x1b[?2026h");
+    }
+
+    public static void EndSynchronizedUpdate()
+    {
+        if (UseSixel)
+            Console.Write("\x1b[?2026l");
     }
 
     public static void RenderSixelOverlay(IReadOnlyList<SixelGraphPoint> points, int topRow, int bottomRow)
@@ -119,7 +163,8 @@ internal static class GraphGraphics
 
         try
         {
-            var cellSize = _cellSize ?? (TryGetConsoleCellSize(out var size) ? size : (8, 16));
+            var signature = ComputeSixelSignature(points, topRow, bottomRow);
+            var cellSize = EffectiveCellSize();
             var cellW = Math.Clamp(cellSize.Width, 4, 32);
             var cellH = Math.Clamp(cellSize.Height, 8, 64);
 
@@ -164,13 +209,51 @@ internal static class GraphGraphics
             Console.Write($"\x1b[{topRow + 1};{minCellX + 1}H");
             Console.Write(sixel);
             Console.Write("\x1b8");
+            _lastSixelSignature = signature;
         }
         catch
         {
             // Rendering must never take down device monitoring. One failure turns
             // Sixel off for the rest of this process; the next frame uses Braille.
             _sixelFailed = true;
+            _lastSixelSignature = null;
         }
+    }
+
+    private static ulong ComputeSixelSignature(IReadOnlyList<SixelGraphPoint> points, int topRow, int bottomRow)
+    {
+        // FNV-1a over geometry plus the effective raster scale. The CPM polling
+        // thread changes the point list roughly once per second, while the TUI can
+        // redraw four times per second; this lets unchanged Sixel images persist.
+        const ulong offset = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+        var hash = offset;
+
+        void Mix(int value)
+        {
+            unchecked
+            {
+                hash ^= (uint)value;
+                hash *= prime;
+                hash ^= (uint)(value >> 16);
+                hash *= prime;
+            }
+        }
+
+        var cell = EffectiveCellSize();
+        Mix(topRow);
+        Mix(bottomRow);
+        Mix(cell.Width);
+        Mix(cell.Height);
+        Mix(points.Count);
+        foreach (var point in points)
+        {
+            Mix(point.SubX);
+            Mix(point.SubY);
+            Mix((int)point.Color);
+        }
+
+        return hash;
     }
 
     private static void DrawLine(byte[,] pixels, int x0, int y0, int x1, int y1, byte color)
