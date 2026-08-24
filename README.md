@@ -4,14 +4,10 @@ A Windows terminal user interface for the **GQ Electronics GMC-300S** Geiger cou
 
 It talks directly to the counter over its USB serial port; GQ's desktop software is not required.
 
-![GMC-300S TUI responsive dashboard](docs/images/gmc300s-dashboard.svg)
-
-*Responsive Windows Terminal dashboard based on an actual GMC-300SRe 1.05 session, showing live CPM/dose, device state, and the scaled multi-row CPM trend graph.*
-
 ## What it does
 
 - Responsive, colored Windows terminal dashboard that expands with the available rows and columns
-- Multi-row CPM time-series graph with current/minimum/average/maximum statistics
+- Braille sub-cell CPM time-series graph with current/minimum/average/maximum statistics
 - Up to ten minutes of in-memory CPM samples; wider terminals reveal more history instead of stretching a fixed 60 points
 - Large block-number CPM readout when the terminal has enough room
 - Compact fallback layout for smaller console windows
@@ -42,7 +38,7 @@ The dashboard automatically changes layout according to the current terminal dim
 - **Wide:** radiation and device panels side-by-side with a detailed CPM graph below
 - **Large:** adds a five-row block-number CPM display and gives most remaining vertical space to the graph
 
-The CPM graph has a scaled Y axis, grid lines, an average reference line, current/min/average/max statistics, and uses as many recent samples as fit across the available terminal width. The polling buffer retains up to roughly ten minutes of samples.
+The detailed CPM graph uses Unicode Braille cells as a 2×4 sub-pixel matrix. Consecutive CPM samples are connected with Bresenham line rasterization in that sub-cell space, which gives slopes and transitions substantially more visual resolution than ordinary `•`, `│`, `╱`, and `╲` terminal glyphs. The graph retains its scaled Y axis, grid lines, average reference line, current/minimum/average/maximum statistics, and uses as many recent samples as fit across the terminal width. The polling buffer retains up to roughly ten minutes of samples.
 
 Color is semantic rather than decorative: cyan identifies radiation/data, yellow emphasizes the live CPM/latest graph point, green identifies healthy/confirmed states, yellow calls attention to caution or clock drift, red is reserved for failures and destructive/expert operations, and dark gray is used for secondary/unsupported information.
 
