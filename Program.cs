@@ -18,7 +18,8 @@ internal static class Program
             return 0;
         }
 
-        var portName = GetArg(args, "--port") ?? "COM10";
+        var defaultPort = OperatingSystem.IsWindows() ? "COM10" : "/dev/ttyUSB0";
+        var portName = GetArg(args, "--port") ?? defaultPort;
         var baudText = GetArg(args, "--baud");
         var baudRate = 57600;
         if (baudText is not null && (!int.TryParse(baudText, out baudRate) || baudRate <= 0))
@@ -28,13 +29,28 @@ internal static class Program
         }
 
         var classic = args.Any(a => string.Equals(a, "--classic", StringComparison.OrdinalIgnoreCase));
+        var json = args.Any(a => string.Equals(a, "--json", StringComparison.OrdinalIgnoreCase));
+        var graphicsText = GetArg(args, "--graphics") ?? "auto";
+        if (!GraphGraphics.TryConfigure(graphicsText, out var graphicsError))
+        {
+            Console.Error.WriteLine(graphicsError);
+            return 2;
+        }
+
+        if (json && classic)
+        {
+            Console.Error.WriteLine("--json and --classic are mutually exclusive.");
+            return 2;
+        }
 
         try
         {
             using var device = new Gmc300sDevice(portName, baudRate);
             device.Open();
 
-            if (classic)
+            if (json)
+                new JsonLineRunner(device).Run();
+            else if (classic)
                 new TuiApp(device).Run();
             else
                 new ResponsiveTuiApp(device).Run();
@@ -44,7 +60,7 @@ internal static class Program
         catch (Exception ex)
         {
             Console.ResetColor();
-            Console.CursorVisible = true;
+            try { Console.CursorVisible = true; } catch { }
             Console.Error.WriteLine();
             Console.Error.WriteLine($"Unable to start: {ex.Message}");
             Console.Error.WriteLine($"Requested serial port: {portName} @ {baudRate} baud");
@@ -53,8 +69,8 @@ internal static class Program
             {
                 var ports = SerialPort.GetPortNames().OrderBy(x => x).ToArray();
                 Console.Error.WriteLine(ports.Length == 0
-                    ? "Windows reported no serial ports through SerialPort.GetPortNames()."
-                    : "Ports reported by Windows: " + string.Join(", ", ports));
+                    ? "SerialPort.GetPortNames() reported no serial ports."
+                    : "Serial ports reported by the OS: " + string.Join(", ", ports));
             }
             catch
             {
@@ -77,12 +93,17 @@ internal static class Program
 
     private static void PrintUsage()
     {
-        Console.WriteLine("GMC-300S Windows TUI");
+        Console.WriteLine("GMC-300S TUI / collector");
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  gmc300s-tui.exe [--port COM10] [--baud 57600] [--classic]");
+        Console.WriteLine("  gmc300s-tui [--port PORT] [--baud 57600] [--graphics auto|sixel|braille]");
+        Console.WriteLine("  gmc300s-tui [--port PORT] [--baud 57600] --json");
+        Console.WriteLine("  gmc300s-tui [--port PORT] [--baud 57600] --classic");
         Console.WriteLine();
-        Console.WriteLine("Defaults are COM10 and 57600 baud.");
-        Console.WriteLine("The responsive colored UI is the default; --classic runs the original compact UI.");
+        Console.WriteLine("Defaults: 57600 baud; COM10 on Windows, /dev/ttyUSB0 on Linux.");
+        Console.WriteLine("--graphics auto prefers Sixel on a supported terminal and falls back to Braille.");
+        Console.WriteLine("--json writes one compact JSON object per sample to stdout (JSON Lines/JSONL).");
+        Console.WriteLine("Diagnostics in --json mode go to stderr so stdout remains machine-readable.");
+        Console.WriteLine("--classic runs the original compact UI.");
     }
 }
