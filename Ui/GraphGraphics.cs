@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -14,8 +15,10 @@ internal readonly record struct SixelGraphPoint(int SubX, int SubY, ConsoleColor
 
 /// <summary>
 /// Chooses the highest-quality graph backend the current terminal can support.
-/// Known Sixel-capable hosts are allowed to use a conservative cell-size fallback
-/// when legacy console font metrics are unavailable (as is normal under ConPTY).
+/// For Sixel, exact terminal cell dimensions matter: a one-pixel-per-cell error
+/// accumulates across a wide graph and makes the apparent right edge drift.
+/// Modern terminals can report the cell size through XTWINOPS CSI 16 t; the
+/// legacy Win32 console-font API remains a fallback for traditional hosts.
 /// </summary>
 internal static class GraphGraphics
 {
@@ -81,18 +84,14 @@ internal static class GraphGraphics
 
         if (_requested == GraphGraphicsMode.Sixel)
         {
-            _cellSize = TryGetConsoleCellSize(out var forcedSize) ? forcedSize : DefaultCellSize();
+            _cellSize = DetectCellSize();
             return GraphGraphicsMode.Sixel;
         }
 
         if (!IsSixelLikelySupported())
             return GraphGraphicsMode.Braille;
 
-        // GetCurrentConsoleFontEx commonly fails when stdout is a Windows Terminal
-        // ConPTY handle rather than a legacy console screen-buffer handle. That is
-        // not evidence that Sixel is unsupported, so known-Sixel hosts use a sane
-        // fallback instead of incorrectly dropping to Braille.
-        _cellSize = TryGetConsoleCellSize(out var size) ? size : DefaultCellSize();
+        _cellSize = DetectCellSize();
         return GraphGraphicsMode.Sixel;
     }
 
@@ -109,29 +108,108 @@ internal static class GraphGraphics
             termProgram.Equals("WezTerm", StringComparison.OrdinalIgnoreCase))
             return true;
 
-        // Unix terminals and SSH sessions sometimes advertise Sixel directly in
-        // TERM. A future capability-query backend can broaden this further.
+        // Unix terminals and SSH sessions sometimes advertise Sixel directly.
         var term = Environment.GetEnvironmentVariable("TERM") ?? string.Empty;
         return term.Contains("sixel", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static (int Width, int Height) DefaultCellSize()
+    private static (int Width, int Height) DetectCellSize()
     {
-        // This is intentionally only a fallback. 8x16 is a common terminal cell
-        // aspect/size and, more importantly, keeps Sixel usable under ConPTY where
-        // the Win32 font-metrics API cannot inspect the actual terminal font.
+        // XTWINOPS CSI 16 t asks the terminal to report character-cell size in
+        // pixels. Windows Terminal replies CSI 6 ; height ; width t. This is the
+        // authoritative value for Sixel because Sixel pixels are device pixels.
+        if (TryQueryTerminalCellSize(out var terminalSize))
+            return terminalSize;
+
+        if (TryGetConsoleCellSize(out var consoleSize))
+            return consoleSize;
+
+        // Last-resort compatibility fallback. Alignment may be imperfect on a
+        // terminal with a differently sized font, but Sixel remains usable.
         return (8, 16);
     }
 
-    private static (int Width, int Height) EffectiveCellSize()
-    {
-        if (TryGetConsoleCellSize(out var live))
-        {
-            _cellSize = live;
-            return live;
-        }
+    private static (int Width, int Height) EffectiveCellSize() =>
+        _cellSize ??= DetectCellSize();
 
-        return _cellSize ??= DefaultCellSize();
+    /// <summary>
+    /// Query XTWINOPS character-cell dimensions (CSI 16 t). The response is
+    /// CSI 6 ; height ; width t. We do this once while the graphics backend is
+    /// being resolved, before normal key processing begins.
+    /// </summary>
+    private static bool TryQueryTerminalCellSize(out (int Width, int Height) size)
+    {
+        size = default;
+        if (Console.IsInputRedirected || Console.IsOutputRedirected)
+            return false;
+
+        try
+        {
+            // Do not risk consuming a real keystroke the user already entered.
+            if (Console.KeyAvailable)
+                return false;
+
+            Console.Write("\u001b[16t");
+            Console.Out.Flush();
+
+            var response = new StringBuilder(32);
+            var stopwatch = Stopwatch.StartNew();
+            var started = false;
+
+            while (stopwatch.ElapsedMilliseconds < 180)
+            {
+                if (!Console.KeyAvailable)
+                {
+                    Thread.Sleep(2);
+                    continue;
+                }
+
+                var ch = Console.ReadKey(intercept: true).KeyChar;
+                if (!started)
+                {
+                    if (ch != '\u001b')
+                        continue;
+                    started = true;
+                }
+
+                response.Append(ch);
+                if (ch == 't' || response.Length >= 31)
+                    break;
+            }
+
+            return TryParseCellSizeResponse(response.ToString(), out size);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryParseCellSizeResponse(string response, out (int Width, int Height) size)
+    {
+        size = default;
+        const string prefix = "\u001b[6;";
+        var start = response.IndexOf(prefix, StringComparison.Ordinal);
+        if (start < 0)
+            return false;
+
+        start += prefix.Length;
+        var end = response.IndexOf('t', start);
+        if (end < 0)
+            return false;
+
+        var payload = response[start..end];
+        var separator = payload.IndexOf(';');
+        if (separator <= 0 || separator >= payload.Length - 1)
+            return false;
+
+        if (!int.TryParse(payload[..separator], out var height) ||
+            !int.TryParse(payload[(separator + 1)..], out var width) ||
+            width <= 0 || height <= 0 || width > 128 || height > 256)
+            return false;
+
+        size = (width, height);
+        return true;
     }
 
     public static void InvalidateSixelOverlay() => _lastSixelSignature = null;
@@ -147,13 +225,13 @@ internal static class GraphGraphics
     public static void BeginSynchronizedUpdate()
     {
         if (UseSixel)
-            Console.Write("\x1b[?2026h");
+            Console.Write("\u001b[?2026h");
     }
 
     public static void EndSynchronizedUpdate()
     {
         if (UseSixel)
-            Console.Write("\x1b[?2026l");
+            Console.Write("\u001b[?2026l");
     }
 
     public static void RenderSixelOverlay(IReadOnlyList<SixelGraphPoint> points, int topRow, int bottomRow)
@@ -203,12 +281,13 @@ internal static class GraphGraphics
             if (sixel.Length == 0)
                 return;
 
-            // Sixel P2=1 keeps untouched pixels transparent, so the terminal's
-            // text grid/average line remains visible behind the raster graph.
-            Console.Write("\x1b7");
-            Console.Write($"\x1b[{topRow + 1};{minCellX + 1}H");
+            // Save/restore cursor using unambiguous ESC sequences. In C#, \x
+            // escapes consume following hexadecimal digits, so "\x1b7" was
+            // accidentally U+01B7 (Ʒ), which is the stray glyph seen on screen.
+            Console.Write("\u001b7");
+            Console.Write($"\u001b[{topRow + 1};{minCellX + 1}H");
             Console.Write(sixel);
-            Console.Write("\x1b8");
+            Console.Write("\u001b8");
             _lastSixelSignature = signature;
         }
         catch
@@ -307,7 +386,7 @@ internal static class GraphGraphics
             return string.Empty;
 
         var sb = new StringBuilder(Math.Min(width * Math.Max(1, height / 3), 1_000_000));
-        sb.Append("\x1bP0;1;0q");               // P2=1: transparent background
+        sb.Append("\u001bP0;1;0q");             // P2=1: transparent background
         sb.Append('"').Append("1;1;").Append(width).Append(';').Append(height);
         sb.Append("#1;2;35;85;85");            // cyan
         sb.Append("#2;2;100;96;62");           // yellow
@@ -347,7 +426,7 @@ internal static class GraphGraphics
                 sb.Append('-');
         }
 
-        sb.Append("\x1b\\");
+        sb.Append("\u001b\\");
         return sb.ToString();
     }
 
