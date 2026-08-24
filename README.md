@@ -6,7 +6,11 @@ It talks directly to the counter over its USB serial port; GQ's desktop software
 
 ## What it does
 
-- Live CPM dashboard with a one-minute rolling sparkline plus min/average/max
+- Responsive, colored Windows terminal dashboard that expands with the available rows and columns
+- Multi-row CPM time-series graph with current/minimum/average/maximum statistics
+- Up to ten minutes of in-memory CPM samples; wider terminals reveal more history instead of stretching a fixed 60 points
+- Large block-number CPM readout when the terminal has enough room
+- Compact fallback layout for smaller console windows
 - Dose-rate estimate (µSv/h and mR/h) using the counter's own three calibration points
 - Battery voltage
 - Device date/time, live PC clock-drift display, and one-key clock synchronization
@@ -23,6 +27,26 @@ It talks directly to the counter over its USB serial port; GQ's desktop software
 - 64 KiB history download using `SPIR`
 - Raw history `.bin` plus best-effort parsed `.csv`
 - Advanced commands: reboot, power off/on, factory reset, raw config-byte write, config erase, config refresh
+
+## Responsive/color UI
+
+The default UI uses a cell-buffer renderer built on `System.Console` colors rather than embedding ANSI escape sequences in strings. This keeps colors from breaking text-width calculations and works in Windows Terminal as well as traditional Windows console hosts.
+
+The dashboard automatically changes layout according to the current terminal dimensions:
+
+- **Compact:** one-column metrics plus a small graph when space allows
+- **Wide:** radiation and device panels side-by-side with a detailed CPM graph below
+- **Large:** adds a five-row block-number CPM display and gives most remaining vertical space to the graph
+
+The CPM graph has a scaled Y axis, grid lines, an average reference line, current/min/average/max statistics, and uses as many recent samples as fit across the available terminal width. The polling buffer retains up to roughly ten minutes of samples.
+
+Color is semantic rather than decorative: cyan identifies radiation/data, yellow emphasizes the live CPM/latest graph point, green identifies healthy/confirmed states, yellow calls attention to caution or clock drift, red is reserved for failures and destructive/expert operations, and dark gray is used for secondary/unsupported information.
+
+The original compact renderer is still included as a fallback during hardware testing:
+
+```powershell
+dotnet run -c Release -- --classic
+```
 
 ## Important safety note about settings
 
@@ -133,9 +157,13 @@ The TUI therefore uses a model capability table. For GMC-300S it:
 - keeps heartbeat disabled during normal command/response polling so unsolicited CPS bytes cannot contaminate replies
 - displays CPS as unavailable rather than showing a misleading zero
 - does not poll `GETTEMP` or `GETGYRO`
-- explicitly marks temperature and orientation as unsupported
+- explicitly marks temperature and orientation as unsupported in device capability information
 
 Unknown models default to the same conservative optional-feature set until verified on hardware.
+
+## Build validation
+
+A Windows GitHub Actions workflow restores and builds the project with .NET 8 on pushes and pull requests to `main`.
 
 ## History parsing
 
