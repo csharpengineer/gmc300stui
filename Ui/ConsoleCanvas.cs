@@ -3,11 +3,11 @@ namespace Gmc300sTui.Ui;
 /// <summary>
 /// Small terminal cell buffer that keeps layout independent from ANSI escape
 /// sequence widths. It uses the standard Console color API, so it works in
-/// Windows Terminal as well as traditional Windows console hosts.
+/// Windows Terminal as well as traditional console hosts.
 ///
-/// The detailed CPM graph is rendered through a Braille overlay. Unicode
-/// Braille gives each terminal cell a 2x4 dot matrix, allowing connected graph
-/// segments to slope smoothly instead of collapsing into vertical jumps.
+/// The detailed CPM graph is captured as a 2x4 sub-cell path. In Braille mode
+/// that path becomes Unicode Braille cells; in Sixel mode the same points are
+/// rendered as a true raster overlay after the text dashboard is drawn.
 /// </summary>
 internal sealed class ConsoleCanvas
 {
@@ -15,13 +15,14 @@ internal sealed class ConsoleCanvas
     private readonly byte[,] _brailleMasks;
     private readonly ConsoleColor[,] _brailleForegrounds;
     private readonly bool[,] _brailleActive;
+    private readonly List<SixelGraphPoint> _sixelGraphPoints = new();
     private (int CellX, int SubX, int SubY)? _lastBrailleGraphPoint;
 
     // DrawCpmGraph writes its scale labels immediately before its cyan data
     // points. Capture those labels so a point that was rounded to a terminal row
     // can be reconstructed to its integer CPM value and then positioned using
     // the full four Braille sub-rows in that cell. This keeps the existing graph
-    // API simple while giving the detailed plot true sub-cell Y resolution.
+    // API simple while giving both Braille and Sixel the same full-resolution path.
     private bool _capturingGraphScale;
     private readonly List<(int Row, int Value)> _graphScaleLabels = new(3);
     private GraphScale? _brailleGraphScale;
@@ -51,6 +52,7 @@ internal sealed class ConsoleCanvas
 
         Array.Clear(_brailleMasks, 0, _brailleMasks.Length);
         Array.Clear(_brailleActive, 0, _brailleActive.Length);
+        _sixelGraphPoints.Clear();
         _lastBrailleGraphPoint = null;
         _capturingGraphScale = false;
         _graphScaleLabels.Clear();
@@ -82,7 +84,7 @@ internal sealed class ConsoleCanvas
             return;
 
         // ResponsiveTuiApp emits its CPM series as cyan point/connector glyphs.
-        // Capture the points and rebuild the path in a 2x4 Braille sub-cell grid.
+        // Capture the points and rebuild the path in a 2x4 sub-cell grid.
         // Connector glyphs are intentionally ignored here; the point sequence is
         // enough to draw a continuous line and avoids the old overwrite problem.
         if (IsBrailleGraphConnector(ch, foreground))
@@ -186,6 +188,7 @@ internal sealed class ConsoleCanvas
         {
             _capturingGraphScale = true;
             _graphScaleLabels.Clear();
+            _sixelGraphPoints.Clear();
             _brailleGraphScale = null;
             _lastBrailleGraphPoint = null;
             return;
@@ -229,10 +232,12 @@ internal sealed class ConsoleCanvas
             {
                 // A non-increasing X means a new plot sequence began on this frame.
                 _lastBrailleGraphPoint = null;
+                _sixelGraphPoints.Clear();
             }
         }
 
         SetBrailleDot(subX, subY, pointColor);
+        _sixelGraphPoints.Add(new SixelGraphPoint(subX, subY, pointColor));
         _lastBrailleGraphPoint = (cellX, subX, subY);
     }
 
@@ -350,6 +355,8 @@ internal sealed class ConsoleCanvas
     private Cell EffectiveCell(int x, int y)
     {
         var baseCell = _cells[y, x];
+        if (GraphGraphics.UseSixel)
+            return baseCell;
         if (!_brailleActive[y, x] || _brailleMasks[y, x] == 0)
             return baseCell;
 
@@ -390,6 +397,9 @@ internal sealed class ConsoleCanvas
                 }
             }
             Console.ResetColor();
+
+            if (GraphGraphics.UseSixel && _brailleGraphScale is { } scale)
+                GraphGraphics.RenderSixelOverlay(_sixelGraphPoints, scale.TopRow, scale.BottomRow);
         }
         catch (ArgumentOutOfRangeException)
         {
