@@ -6,8 +6,8 @@ namespace Gmc300sTui.Ui;
 /// Windows Terminal as well as traditional console hosts.
 ///
 /// The detailed CPM graph is captured as a 2x4 sub-cell path. In Braille mode
-/// that path becomes Unicode Braille cells; in Sixel mode the same points are
-/// rendered as a true raster overlay after the text dashboard is drawn.
+/// that path becomes Unicode Braille cells; in Sixel mode the same points feed an
+/// opaque raster framebuffer that is prepared offscreen and swapped into place.
 /// </summary>
 internal sealed class ConsoleCanvas
 {
@@ -18,14 +18,16 @@ internal sealed class ConsoleCanvas
     private readonly List<SixelGraphPoint> _sixelGraphPoints = new();
     private (int CellX, int SubX, int SubY)? _lastBrailleGraphPoint;
 
-    // DrawCpmGraph writes its scale labels immediately before its cyan data
-    // points. Capture those labels so a point that was rounded to a terminal row
-    // can be reconstructed to its integer CPM value and then positioned using
-    // the full four Braille sub-rows in that cell. This keeps the existing graph
-    // API simple while giving both Braille and Sixel the same full-resolution path.
+    // DrawCpmGraph writes its statistics, scale labels, average annotation and
+    // right-side "now" marker in a predictable sequence. Capture those values so
+    // Sixel can own the entire plot rectangle rather than acting as a transparent
+    // overlay on text-drawn grid lines.
     private bool _capturingGraphScale;
     private readonly List<(int Row, int Value)> _graphScaleLabels = new(3);
     private GraphScale? _brailleGraphScale;
+    private int? _sixelPlotX;
+    private int? _sixelPlotRight;
+    private double? _sixelAverage;
 
     private readonly record struct Cell(char Ch, ConsoleColor Foreground, ConsoleColor Background);
     private readonly record struct GraphScale(int TopRow, int BottomRow, int MinValue, int MaxValue);
@@ -57,6 +59,9 @@ internal sealed class ConsoleCanvas
         _capturingGraphScale = false;
         _graphScaleLabels.Clear();
         _brailleGraphScale = null;
+        _sixelPlotX = null;
+        _sixelPlotRight = null;
+        _sixelAverage = null;
     }
 
     public void Fill(int x, int y, int width, int height, char ch = ' ',
@@ -83,10 +88,6 @@ internal sealed class ConsoleCanvas
         if (x < 0 || x >= Width || y < 0 || y >= Height)
             return;
 
-        // ResponsiveTuiApp emits its CPM series as cyan point/connector glyphs.
-        // Capture the points and rebuild the path in a 2x4 sub-cell grid.
-        // Connector glyphs are intentionally ignored here; the point sequence is
-        // enough to draw a continuous line and avoids the old overwrite problem.
         if (IsBrailleGraphConnector(ch, foreground))
             return;
 
@@ -107,6 +108,8 @@ internal sealed class ConsoleCanvas
     {
         if (string.IsNullOrEmpty(text) || y < 0 || y >= Height || x >= Width)
             return;
+
+        ObserveGraphAverage(text, foreground);
 
         var limit = Math.Min(maxWidth ?? int.MaxValue, Width - Math.Max(0, x));
         if (limit <= 0)
@@ -131,7 +134,7 @@ internal sealed class ConsoleCanvas
     {
         if (string.IsNullOrEmpty(text)) return;
 
-        ObserveGraphScaleLabel(y, text);
+        ObserveGraphScaleLabel(rightX, y, text);
         Write(rightX - text.Length + 1, y, text, foreground, background);
     }
 
@@ -173,16 +176,11 @@ internal sealed class ConsoleCanvas
         Put(x + width - 1, y + height - 1, '┘', color);
 
         if (!string.IsNullOrWhiteSpace(title) && width > title.Length + 4)
-        {
             Write(x + 2, y, $" {title} ", titleColor, ConsoleColor.Black, width - 4);
-        }
     }
 
-    private void ObserveGraphScaleLabel(int y, string text)
+    private void ObserveGraphScaleLabel(int rightX, int y, string text)
     {
-        // The detailed graph's statistics string is unique enough to delimit a
-        // new scale-capture sequence without coupling the canvas to screen
-        // coordinates. DrawCpmGraph then writes top/middle/bottom integer labels.
         if (text.StartsWith("now ", StringComparison.Ordinal) &&
             text.Contains(" samples", StringComparison.Ordinal))
         {
@@ -191,6 +189,17 @@ internal sealed class ConsoleCanvas
             _sixelGraphPoints.Clear();
             _brailleGraphScale = null;
             _lastBrailleGraphPoint = null;
+            _sixelPlotX = null;
+            _sixelPlotRight = null;
+            _sixelAverage = null;
+            return;
+        }
+
+        // The bottom-right time marker is written at the actual right edge of the
+        // plot. Recording it avoids guessing plot width from the amount of data.
+        if (text.Equals("now", StringComparison.Ordinal) && _brailleGraphScale is not null)
+        {
+            _sixelPlotRight = rightX;
             return;
         }
 
@@ -198,6 +207,9 @@ internal sealed class ConsoleCanvas
             !int.TryParse(text, System.Globalization.NumberStyles.Integer,
                 System.Globalization.CultureInfo.InvariantCulture, out var value))
             return;
+
+        if (_graphScaleLabels.Count == 0)
+            _sixelPlotX = rightX + 2;
 
         _graphScaleLabels.Add((y, value));
         if (_graphScaleLabels.Count < 3)
@@ -209,6 +221,39 @@ internal sealed class ConsoleCanvas
             _brailleGraphScale = new GraphScale(top.Row, bottom.Row, bottom.Value, top.Value);
 
         _capturingGraphScale = false;
+    }
+
+    private void ObserveGraphAverage(string text, ConsoleColor foreground)
+    {
+        if (foreground != ConsoleColor.DarkYellow ||
+            !text.StartsWith("avg ", StringComparison.Ordinal))
+            return;
+
+        if (double.TryParse(
+                text.AsSpan(4),
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var average))
+            _sixelAverage = average;
+    }
+
+    private SixelGraphFrame? GetSixelGraphFrame()
+    {
+        if (_brailleGraphScale is not { } scale ||
+            _sixelPlotX is not int plotX ||
+            _sixelPlotRight is not int plotRight ||
+            _sixelAverage is not double average ||
+            plotRight < plotX)
+            return null;
+
+        return new SixelGraphFrame(
+            plotX,
+            scale.TopRow,
+            plotRight - plotX + 1,
+            scale.BottomRow - scale.TopRow + 1,
+            scale.MinValue,
+            scale.MaxValue,
+            average);
     }
 
     private static bool IsBrailleGraphPoint(char ch, ConsoleColor foreground) =>
@@ -230,7 +275,6 @@ internal sealed class ConsoleCanvas
             }
             else
             {
-                // A non-increasing X means a new plot sequence began on this frame.
                 _lastBrailleGraphPoint = null;
                 _sixelGraphPoints.Clear();
             }
@@ -250,11 +294,6 @@ internal sealed class ConsoleCanvas
             return cellY * 4 + 2;
         }
 
-        // ValueToRow in ResponsiveTuiApp rounds an integer CPM value to the
-        // nearest terminal row. In the normal background-radiation ranges there
-        // are more plot rows than distinct CPM values, so this inversion recovers
-        // that integer value exactly. We then map the recovered value over every
-        // Braille sub-row instead of snapping it back to the cell center.
         var rowSpan = scale.BottomRow - scale.TopRow;
         var rowFromBottom = scale.BottomRow - cellY;
         var approximateValue = scale.MinValue +
@@ -264,9 +303,6 @@ internal sealed class ConsoleCanvas
             scale.MinValue,
             scale.MaxValue);
 
-        // Stay slightly inside the top/bottom terminal rows so the series does
-        // not visually collide with the graph frame while still using essentially
-        // all four sub-rows per cell.
         var topSubY = scale.TopRow * 4 + 1;
         var bottomSubY = scale.BottomRow * 4 + 2;
         var fraction = (cpm - scale.MinValue) / (double)(scale.MaxValue - scale.MinValue);
@@ -277,7 +313,6 @@ internal sealed class ConsoleCanvas
 
     private void PlotBrailleLine(int x0, int y0, int x1, int y1, ConsoleColor color)
     {
-        // Integer Bresenham in Braille sub-pixel coordinates.
         var dx = Math.Abs(x1 - x0);
         var sx = x0 < x1 ? 1 : -1;
         var dy = -Math.Abs(y1 - y0);
@@ -326,14 +361,14 @@ internal sealed class ConsoleCanvas
 
     private static byte BrailleBit(int x, int y) => (x, y) switch
     {
-        (0, 0) => 1 << 0, // dot 1
-        (0, 1) => 1 << 1, // dot 2
-        (0, 2) => 1 << 2, // dot 3
-        (0, 3) => 1 << 6, // dot 7
-        (1, 0) => 1 << 3, // dot 4
-        (1, 1) => 1 << 4, // dot 5
-        (1, 2) => 1 << 5, // dot 6
-        (1, 3) => 1 << 7, // dot 8
+        (0, 0) => 1 << 0,
+        (0, 1) => 1 << 1,
+        (0, 2) => 1 << 2,
+        (0, 3) => 1 << 6,
+        (1, 0) => 1 << 3,
+        (1, 1) => 1 << 4,
+        (1, 2) => 1 << 5,
+        (1, 3) => 1 << 7,
         _ => 0
     };
 
@@ -366,6 +401,40 @@ internal sealed class ConsoleCanvas
             baseCell.Background);
     }
 
+    private void RenderRange(int y, int firstX, int lastX)
+    {
+        if (y < 0 || y >= Height)
+            return;
+
+        firstX = Math.Clamp(firstX, 0, Width - 1);
+        lastX = Math.Clamp(lastX, 0, Width - 1);
+        if (lastX < firstX)
+            return;
+
+        Console.SetCursorPosition(firstX, y);
+        var x = firstX;
+        while (x <= lastX)
+        {
+            var cell = EffectiveCell(x, y);
+            var start = x;
+            x++;
+            while (x <= lastX)
+            {
+                var next = EffectiveCell(x, y);
+                if (next.Foreground != cell.Foreground || next.Background != cell.Background)
+                    break;
+                x++;
+            }
+
+            Console.ForegroundColor = cell.Foreground;
+            Console.BackgroundColor = cell.Background;
+            var chars = new char[x - start];
+            for (var i = 0; i < chars.Length; i++)
+                chars[i] = EffectiveCell(start + i, y).Ch;
+            Console.Write(chars);
+        }
+    }
+
     private void RenderRows(int firstRow, int lastRow)
     {
         firstRow = Math.Clamp(firstRow, 0, Height - 1);
@@ -374,30 +443,34 @@ internal sealed class ConsoleCanvas
             return;
 
         for (var y = firstRow; y <= lastRow; y++)
-        {
-            Console.SetCursorPosition(0, y);
-            var x = 0;
-            while (x < Width)
-            {
-                var cell = EffectiveCell(x, y);
-                var start = x;
-                x++;
-                while (x < Width)
-                {
-                    var next = EffectiveCell(x, y);
-                    if (next.Foreground != cell.Foreground || next.Background != cell.Background)
-                        break;
-                    x++;
-                }
+            RenderRange(y, 0, Width - 1);
+    }
 
-                Console.ForegroundColor = cell.Foreground;
-                Console.BackgroundColor = cell.Background;
-                var chars = new char[x - start];
-                for (var i = 0; i < chars.Length; i++)
-                    chars[i] = EffectiveCell(start + i, y).Ch;
-                Console.Write(chars);
-            }
+    /// <summary>
+    /// Render all text except the rectangle owned by the persistent Sixel image.
+    /// This is the crucial difference from the earlier overlay implementation:
+    /// we never erase the visible graph before presenting its prepared successor.
+    /// </summary>
+    private void RenderOutsideGraphFrame(SixelGraphFrame frame)
+    {
+        var top = Math.Clamp(frame.PlotY, 0, Height - 1);
+        var bottom = Math.Clamp(frame.PlotY + frame.PlotHeight - 1, 0, Height - 1);
+        var left = Math.Clamp(frame.PlotX, 0, Width - 1);
+        var right = Math.Clamp(frame.PlotX + frame.PlotWidth - 1, 0, Width - 1);
+
+        if (top > 0)
+            RenderRows(0, top - 1);
+
+        for (var y = top; y <= bottom; y++)
+        {
+            if (left > 0)
+                RenderRange(y, 0, left - 1);
+            if (right < Width - 1)
+                RenderRange(y, right + 1, Width - 1);
         }
+
+        if (bottom < Height - 1)
+            RenderRows(bottom + 1, Height - 1);
     }
 
     public void Render()
@@ -406,9 +479,6 @@ internal sealed class ConsoleCanvas
         {
             Console.CursorVisible = false;
 
-            // Console.Clear() and several host operations place the cursor at 0,0.
-            // If that happened outside this canvas, the terminal no longer contains
-            // our cached Sixel image even if the CPM geometry has not changed.
             try
             {
                 if (Console.CursorLeft == 0 && Console.CursorTop == 0)
@@ -419,48 +489,48 @@ internal sealed class ConsoleCanvas
                 // Cursor queries are only a best-effort invalidation hint.
             }
 
+            var sixelFrame = GetSixelGraphFrame();
             if (GraphGraphics.UseSixel &&
-                _brailleGraphScale is { } scale &&
+                sixelFrame is { } frame &&
                 _sixelGraphPoints.Count >= 2)
             {
-                var graphDirty = GraphGraphics.IsSixelOverlayDirty(
-                    _sixelGraphPoints, scale.TopRow, scale.BottomRow);
+                var graphDirty = GraphGraphics.IsSixelFrameDirty(_sixelGraphPoints, frame);
 
                 if (graphDirty)
                 {
-                    // Repaint the text underneath and replace the raster only when
-                    // the CPM data/scale actually changed (roughly once per second).
-                    // Synchronized output lets supporting terminals present that
-                    // clear+replacement as a single visual update.
-                    GraphGraphics.BeginSynchronizedUpdate();
-                    try
+                    // The expensive rasterization and Sixel encoding happens before
+                    // synchronized output begins: this is our actual back buffer.
+                    if (GraphGraphics.TryPrepareSixelFrame(_sixelGraphPoints, frame, out var prepared))
                     {
+                        GraphGraphics.BeginSynchronizedUpdate();
+                        try
+                        {
+                            RenderOutsideGraphFrame(frame);
+                            Console.ResetColor();
+                            GraphGraphics.PresentSixelFrame(prepared);
+                        }
+                        finally
+                        {
+                            GraphGraphics.EndSynchronizedUpdate();
+                        }
+                    }
+                    else
+                    {
+                        // Preparation failure switches the backend to Braille.
                         RenderRows(0, Height - 1);
                         Console.ResetColor();
-                        GraphGraphics.RenderSixelOverlay(
-                            _sixelGraphPoints, scale.TopRow, scale.BottomRow);
-                    }
-                    finally
-                    {
-                        GraphGraphics.EndSynchronizedUpdate();
                     }
                 }
                 else
                 {
-                    // A normal TUI frame arrives every 250 ms. Do not write spaces
-                    // or grid characters through the rows occupied by the persistent
-                    // Sixel image; doing so makes Windows Terminal erase the raster.
-                    if (scale.TopRow > 0)
-                        RenderRows(0, scale.TopRow - 1);
-                    if (scale.BottomRow < Height - 1)
-                        RenderRows(scale.BottomRow + 1, Height - 1);
+                    // Ordinary 250 ms dashboard updates never touch the raster
+                    // rectangle. The current Sixel image simply remains displayed.
+                    RenderOutsideGraphFrame(frame);
                     Console.ResetColor();
                 }
             }
             else
             {
-                // Screens without a Sixel graph overwrite the whole terminal, so
-                // returning to the dashboard must force a fresh raster image.
                 GraphGraphics.InvalidateSixelOverlay();
                 RenderRows(0, Height - 1);
                 Console.ResetColor();
@@ -468,13 +538,10 @@ internal sealed class ConsoleCanvas
         }
         catch (ArgumentOutOfRangeException)
         {
-            // The user resized the terminal between measuring it and rendering.
-            // The next frame will use the new dimensions.
             GraphGraphics.InvalidateSixelOverlay();
         }
         catch (IOException)
         {
-            // Console host changed/disconnected during a frame. A later frame can retry.
             GraphGraphics.InvalidateSixelOverlay();
         }
     }
