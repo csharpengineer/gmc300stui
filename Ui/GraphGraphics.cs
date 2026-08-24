@@ -13,12 +13,32 @@ internal enum GraphGraphicsMode
 
 internal readonly record struct SixelGraphPoint(int SubX, int SubY, ConsoleColor Color);
 
+internal readonly record struct SixelGraphFrame(
+    int PlotX,
+    int PlotY,
+    int PlotWidth,
+    int PlotHeight,
+    int ScaleMin,
+    int ScaleMax,
+    double Average);
+
+internal readonly record struct PreparedSixelFrame(
+    string Payload,
+    int Row,
+    int Column,
+    ulong Signature);
+
 /// <summary>
 /// Chooses the highest-quality graph backend the current terminal can support.
 /// For Sixel, exact terminal cell dimensions matter: a one-pixel-per-cell error
 /// accumulates across a wide graph and makes the apparent right edge drift.
 /// Modern terminals can report the cell size through XTWINOPS CSI 16 t; the
 /// legacy Win32 console-font API remains a fallback for traditional hosts.
+///
+/// Sixel frames are built completely in memory before synchronized output begins.
+/// The prepared image is opaque and includes the graph background, grid, average
+/// line, trace, and current-point marker. Presenting it therefore behaves much
+/// like swapping a graphics back buffer: no blank/cleared graph frame is needed.
 /// </summary>
 internal static class GraphGraphics
 {
@@ -97,8 +117,6 @@ internal static class GraphGraphics
 
     private static bool IsSixelLikelySupported()
     {
-        // Windows Terminal exports WT_SESSION. WT_PROFILE_ID is included as a
-        // secondary marker for hosts/profiles where WT_SESSION is not propagated.
         if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("WT_SESSION")) ||
             !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("WT_PROFILE_ID")))
             return true;
@@ -108,35 +126,24 @@ internal static class GraphGraphics
             termProgram.Equals("WezTerm", StringComparison.OrdinalIgnoreCase))
             return true;
 
-        // Unix terminals and SSH sessions sometimes advertise Sixel directly.
         var term = Environment.GetEnvironmentVariable("TERM") ?? string.Empty;
         return term.Contains("sixel", StringComparison.OrdinalIgnoreCase);
     }
 
     private static (int Width, int Height) DetectCellSize()
     {
-        // XTWINOPS CSI 16 t asks the terminal to report character-cell size in
-        // pixels. Windows Terminal replies CSI 6 ; height ; width t. This is the
-        // authoritative value for Sixel because Sixel pixels are device pixels.
         if (TryQueryTerminalCellSize(out var terminalSize))
             return terminalSize;
 
         if (TryGetConsoleCellSize(out var consoleSize))
             return consoleSize;
 
-        // Last-resort compatibility fallback. Alignment may be imperfect on a
-        // terminal with a differently sized font, but Sixel remains usable.
         return (8, 16);
     }
 
     private static (int Width, int Height) EffectiveCellSize() =>
         _cellSize ??= DetectCellSize();
 
-    /// <summary>
-    /// Query XTWINOPS character-cell dimensions (CSI 16 t). The response is
-    /// CSI 6 ; height ; width t. We do this once while the graphics backend is
-    /// being resolved, before normal key processing begins.
-    /// </summary>
     private static bool TryQueryTerminalCellSize(out (int Width, int Height) size)
     {
         size = default;
@@ -145,7 +152,6 @@ internal static class GraphGraphics
 
         try
         {
-            // Do not risk consuming a real keystroke the user already entered.
             if (Console.KeyAvailable)
                 return false;
 
@@ -214,12 +220,12 @@ internal static class GraphGraphics
 
     public static void InvalidateSixelOverlay() => _lastSixelSignature = null;
 
-    public static bool IsSixelOverlayDirty(IReadOnlyList<SixelGraphPoint> points, int topRow, int bottomRow)
+    public static bool IsSixelFrameDirty(IReadOnlyList<SixelGraphPoint> points, SixelGraphFrame frame)
     {
-        if (!UseSixel || points.Count < 2 || bottomRow < topRow)
+        if (!UseSixel || points.Count < 2 || frame.PlotWidth < 1 || frame.PlotHeight < 1)
             return false;
 
-        return _lastSixelSignature != ComputeSixelSignature(points, topRow, bottomRow);
+        return _lastSixelSignature != ComputeSixelSignature(points, frame);
     }
 
     public static void BeginSynchronizedUpdate()
@@ -234,35 +240,56 @@ internal static class GraphGraphics
             Console.Write("\u001b[?2026l");
     }
 
-    public static void RenderSixelOverlay(IReadOnlyList<SixelGraphPoint> points, int topRow, int bottomRow)
+    /// <summary>
+    /// Build and encode the complete next graph frame in memory. Nothing is sent
+    /// to the terminal until this method has successfully produced the payload.
+    /// </summary>
+    public static bool TryPrepareSixelFrame(
+        IReadOnlyList<SixelGraphPoint> points,
+        SixelGraphFrame frame,
+        out PreparedSixelFrame prepared)
     {
-        if (!UseSixel || points.Count < 2 || bottomRow < topRow)
-            return;
+        prepared = default;
+        if (!UseSixel || points.Count < 2 || frame.PlotWidth < 1 || frame.PlotHeight < 1)
+            return false;
 
         try
         {
-            var signature = ComputeSixelSignature(points, topRow, bottomRow);
+            var signature = ComputeSixelSignature(points, frame);
             var cellSize = EffectiveCellSize();
             var cellW = Math.Clamp(cellSize.Width, 4, 32);
             var cellH = Math.Clamp(cellSize.Height, 8, 64);
+            var pixelWidth = Math.Max(1, frame.PlotWidth * cellW);
+            var pixelHeight = Math.Max(1, frame.PlotHeight * cellH);
 
-            var minCellX = points.Min(p => p.SubX / 2);
-            var maxCellX = points.Max(p => p.SubX / 2);
-            var widthCells = Math.Max(1, maxCellX - minCellX + 1);
-            var heightCells = Math.Max(1, bottomRow - topRow + 1);
-            var pixelWidth = Math.Max(1, widthCells * cellW);
-            var pixelHeight = Math.Max(1, heightCells * cellH);
-
-            // 0 = transparent, 1 = cyan graph, 2 = yellow latest point.
+            // Palette indexes:
+            // 0 black background, 1 cyan trace, 2 yellow current point,
+            // 3 dark-gray scale grid, 4 dark-yellow average line.
             var pixels = new byte[pixelHeight, pixelWidth];
+
+            var topGridY = CellRowToPixel(0, cellH, pixelHeight);
+            var midGridY = CellRowToPixel(frame.PlotHeight / 2, cellH, pixelHeight);
+            var bottomGridY = CellRowToPixel(frame.PlotHeight - 1, cellH, pixelHeight);
+            DrawDottedHorizontal(pixels, topGridY, Math.Max(2, cellW * 2), 3);
+            DrawDottedHorizontal(pixels, midGridY, Math.Max(2, cellW * 2), 3);
+            DrawDottedHorizontal(pixels, bottomGridY, Math.Max(2, cellW * 2), 3);
+
+            var averageFraction = frame.ScaleMax <= frame.ScaleMin
+                ? 0.5
+                : (frame.Average - frame.ScaleMin) / (frame.ScaleMax - frame.ScaleMin);
+            averageFraction = Math.Clamp(averageFraction, 0.0, 1.0);
+            var averageY = pixelHeight - 1 - (int)Math.Round(averageFraction * (pixelHeight - 1));
+            DrawDottedHorizontal(pixels, averageY, Math.Max(2, cellW * 2), 4);
 
             (int X, int Y) ToPixel(SixelGraphPoint point)
             {
-                var localSubX = point.SubX - minCellX * 2;
-                var localSubY = point.SubY - topRow * 4;
+                var localSubX = point.SubX - frame.PlotX * 2;
+                var localSubY = point.SubY - frame.PlotY * 4;
                 var px = (int)Math.Round((localSubX + 0.5) * cellW / 2.0);
                 var py = (int)Math.Round((localSubY + 0.5) * cellH / 4.0);
-                return (Math.Clamp(px, 0, pixelWidth - 1), Math.Clamp(py, 0, pixelHeight - 1));
+                return (
+                    Math.Clamp(px, 0, pixelWidth - 1),
+                    Math.Clamp(py, 0, pixelHeight - 1));
             }
 
             var previous = ToPixel(points[0]);
@@ -277,36 +304,58 @@ internal static class GraphGraphics
             var latest = ToPixel(points[^1]);
             DrawDisc(pixels, latest.X, latest.Y, Math.Max(2, cellH / 8), 2);
 
-            var sixel = EncodeSixel(pixels);
-            if (sixel.Length == 0)
-                return;
+            var payload = EncodeOpaqueSixel(pixels);
+            if (payload.Length == 0)
+                return false;
 
-            // Save/restore cursor using unambiguous ESC sequences. In C#, \x
-            // escapes consume following hexadecimal digits, so "\x1b7" was
-            // accidentally U+01B7 (Ʒ), which is the stray glyph seen on screen.
-            Console.Write("\u001b7");
-            Console.Write($"\u001b[{topRow + 1};{minCellX + 1}H");
-            Console.Write(sixel);
-            Console.Write("\u001b8");
-
-            // ResponsiveTuiApp deliberately leaves one terminal column and one
-            // row unused so writing a character into the bottom-right cell can
-            // never trigger an implicit wrap/scroll. Windows Terminal may reflow
-            // old cells into those untouched margins during a resize, leaving
-            // random-looking letters along the right/bottom edges. ECH/EL erase
-            // cells without advancing the cursor, so we can clean those margins
-            // without ever writing into the dangerous bottom-right cell.
-            EraseReservedTerminalMargins();
-
-            _lastSixelSignature = signature;
+            prepared = new PreparedSixelFrame(
+                payload,
+                frame.PlotY + 1,
+                frame.PlotX + 1,
+                signature);
+            return true;
         }
         catch
         {
-            // Rendering must never take down device monitoring. One failure turns
-            // Sixel off for the rest of this process; the next frame uses Braille.
+            _sixelFailed = true;
+            _lastSixelSignature = null;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Present a frame that has already been rasterized and Sixel-encoded.
+    /// Call this inside a synchronized-output block for swap-buffer-like behavior.
+    /// </summary>
+    public static void PresentSixelFrame(PreparedSixelFrame prepared)
+    {
+        if (!UseSixel || string.IsNullOrEmpty(prepared.Payload))
+            return;
+
+        try
+        {
+            Console.Write("\u001b7");
+            Console.Write($"\u001b[{prepared.Row};{prepared.Column}H");
+            Console.Write(prepared.Payload);
+            Console.Write("\u001b8");
+            EraseReservedTerminalMargins();
+            _lastSixelSignature = prepared.Signature;
+        }
+        catch
+        {
             _sixelFailed = true;
             _lastSixelSignature = null;
         }
+    }
+
+    private static int CellRowToPixel(int row, int cellH, int pixelHeight) =>
+        Math.Clamp(row * cellH + Math.Max(0, cellH / 2), 0, pixelHeight - 1);
+
+    private static void DrawDottedHorizontal(byte[,] pixels, int y, int step, byte color)
+    {
+        var width = pixels.GetLength(1);
+        for (var x = 0; x < width; x += Math.Max(1, step))
+            SetPixel(pixels, x, y, color);
     }
 
     private static void EraseReservedTerminalMargins()
@@ -322,29 +371,19 @@ internal static class GraphGraphics
                 return;
 
             Console.Write("\u001b7");
-
-            // Erase the reserved rightmost cell of every row except the final row.
-            // CSI X (ECH) removes a cell but does not move the cursor or wrap.
             for (var row = 1; row < height; row++)
                 Console.Write($"\u001b[{row};{width}H\u001b[1X");
-
-            // Erase the entire reserved bottom row. CSI 2 K (EL) does not advance
-            // the cursor, so clearing this row cannot scroll the terminal.
             Console.Write($"\u001b[{height};1H\u001b[2K");
             Console.Write("\u001b8");
         }
         catch
         {
-            // A resize can race these WindowWidth/WindowHeight reads. The next
-            // successful graph update will clean the margins again.
+            // Resize races are harmless; the next successful graph update retries.
         }
     }
 
-    private static ulong ComputeSixelSignature(IReadOnlyList<SixelGraphPoint> points, int topRow, int bottomRow)
+    private static ulong ComputeSixelSignature(IReadOnlyList<SixelGraphPoint> points, SixelGraphFrame frame)
     {
-        // FNV-1a over geometry plus the effective raster scale. The CPM polling
-        // thread changes the point list roughly once per second, while the TUI can
-        // redraw four times per second; this lets unchanged Sixel images persist.
         const ulong offset = 14695981039346656037UL;
         const ulong prime = 1099511628211UL;
         var hash = offset;
@@ -361,8 +400,13 @@ internal static class GraphGraphics
         }
 
         var cell = EffectiveCellSize();
-        Mix(topRow);
-        Mix(bottomRow);
+        Mix(frame.PlotX);
+        Mix(frame.PlotY);
+        Mix(frame.PlotWidth);
+        Mix(frame.PlotHeight);
+        Mix(frame.ScaleMin);
+        Mix(frame.ScaleMax);
+        Mix(BitConverter.DoubleToInt64Bits(frame.Average).GetHashCode());
         Mix(cell.Width);
         Mix(cell.Height);
         Mix(points.Count);
@@ -419,23 +463,33 @@ internal static class GraphGraphics
         pixels[y, x] = color;
     }
 
-    private static string EncodeSixel(byte[,] pixels)
+    private static string EncodeOpaqueSixel(byte[,] pixels)
     {
         var height = pixels.GetLength(0);
         var width = pixels.GetLength(1);
         if (height == 0 || width == 0)
             return string.Empty;
 
-        var sb = new StringBuilder(Math.Min(width * Math.Max(1, height / 3), 1_000_000));
-        sb.Append("\u001bP0;1;0q");             // P2=1: transparent background
+        var sb = new StringBuilder(Math.Min(width * Math.Max(1, height / 2), 2_000_000));
+        sb.Append("\u001bP0;0;0q");             // P2=0: opaque replacement
         sb.Append('"').Append("1;1;").Append(width).Append(';').Append(height);
-        sb.Append("#1;2;35;85;85");            // cyan
-        sb.Append("#2;2;100;96;62");           // yellow
+        sb.Append("#0;2;0;0;0");                // black background
+        sb.Append("#1;2;35;85;85");            // cyan trace
+        sb.Append("#2;2;100;96;62");           // yellow current point
+        sb.Append("#3;2;30;32;34");            // dark gray grid
+        sb.Append("#4;2;70;60;0");              // dark yellow average
 
         for (var bandY = 0; bandY < height; bandY += 6)
         {
-            var wroteColor = false;
-            for (byte color = 1; color <= 2; color++)
+            // Explicitly paint the complete background for this sixel band. This
+            // makes replacement independent of transparency behavior in the host.
+            byte backgroundMask = 0;
+            for (var bit = 0; bit < 6 && bandY + bit < height; bit++)
+                backgroundMask |= (byte)(1 << bit);
+            sb.Append("#0");
+            AppendRleSixels(sb, Enumerable.Repeat(backgroundMask, width).ToArray(), width);
+
+            foreach (byte color in new byte[] { 3, 4, 1, 2 })
             {
                 var masks = new byte[width];
                 var lastNonZero = -1;
@@ -456,11 +510,8 @@ internal static class GraphGraphics
                 if (lastNonZero < 0)
                     continue;
 
-                if (wroteColor)
-                    sb.Append('$');
-                sb.Append('#').Append(color);
+                sb.Append('$').Append('#').Append(color);
                 AppendRleSixels(sb, masks, lastNonZero + 1);
-                wroteColor = true;
             }
 
             if (bandY + 6 < height)
