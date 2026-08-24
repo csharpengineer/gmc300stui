@@ -4,6 +4,10 @@ A Windows terminal user interface for the **GQ Electronics GMC-300S** Geiger cou
 
 It talks directly to the counter over its USB serial port; GQ's desktop software is not required.
 
+![GMC-300S TUI responsive dashboard](docs/images/gmc300s-dashboard.png)
+
+*Responsive Windows Terminal dashboard running against a GMC-300SRe 1.05, showing live CPM/dose, device state, and the scaled multi-row CPM trend graph.*
+
 ## What it does
 
 - Responsive, colored Windows terminal dashboard that expands with the available rows and columns
