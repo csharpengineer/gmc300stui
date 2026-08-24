@@ -1,16 +1,18 @@
-# GMC-300S Windows TUI
+# GMC-300S TUI / Collector
 
-A Windows terminal user interface for the **GQ Electronics GMC-300S** Geiger counter, written in C#/.NET 8.
+A C#/.NET 8 terminal interface and data collector for the **GQ Electronics GMC-300S** Geiger counter.
 
-It talks directly to the counter over its USB serial port; GQ's desktop software is not required.
+It talks directly to the counter over its USB serial port; GQ's desktop software is not required. The project targets plain `net8.0` and builds on both Windows and Linux.
 
 ## What it does
 
-- Responsive, colored Windows terminal dashboard that expands with the available rows and columns
-- Braille sub-cell CPM time-series graph with current/minimum/average/maximum statistics
+- Responsive, colored terminal dashboard that expands with the available rows and columns
+- Automatic **Sixel raster graph** on supported terminals with full-resolution Unicode Braille fallback
+- Detailed CPM time-series graph with current/minimum/average/maximum statistics
 - Up to ten minutes of in-memory CPM samples; wider terminals reveal more history instead of stretching a fixed 60 points
 - Large block-number CPM readout when the terminal has enough room
 - Compact fallback layout for smaller console windows
+- `--json` streaming mode that emits clean JSON Lines/JSONL to stdout
 - Dose-rate estimate (µSv/h and mR/h) using the counter's own three calibration points
 - Battery voltage
 - Device date/time, live PC clock-drift display, and one-key clock synchronization
@@ -28,17 +30,27 @@ It talks directly to the counter over its USB serial port; GQ's desktop software
 - Raw history `.bin` plus best-effort parsed `.csv`
 - Advanced commands: reboot, power off/on, factory reset, raw config-byte write, config erase, config refresh
 
-## Responsive/color UI
+## Graphics backends
 
-The default UI uses a cell-buffer renderer built on `System.Console` colors rather than embedding ANSI escape sequences in strings. This keeps colors from breaking text-width calculations and works in Windows Terminal as well as traditional Windows console hosts.
+The dashboard keeps the text UI independent from the graph renderer. Use:
 
-The dashboard automatically changes layout according to the current terminal dimensions:
+```text
+--graphics auto
+--graphics sixel
+--graphics braille
+```
+
+`auto` is the default. On a supported Windows Terminal session it uses **Sixel**, drawing the CPM series as a real raster image over the text graph area. The Sixel image uses a transparent background so the terminal grid, scale labels, average reference line, and surrounding TUI remain visible.
+
+If Sixel is unavailable or fails during a session, rendering automatically falls back to **Unicode Braille**. Braille provides a 2×4 sub-cell matrix per character cell and uses Bresenham line rasterization, so it still produces a smooth high-resolution graph over ordinary terminal text.
+
+The current automatic Sixel detection is intentionally conservative. Windows Terminal is detected through `WT_SESSION` and its console font metrics are used to size the raster correctly. Linux/SSH builds currently default to Braille unless Sixel is explicitly selected; broader terminal capability/cell-size probing can be added later.
+
+The rest of the responsive layout has three size tiers:
 
 - **Compact:** one-column metrics plus a small graph when space allows
 - **Wide:** radiation and device panels side-by-side with a detailed CPM graph below
 - **Large:** adds a five-row block-number CPM display and gives most remaining vertical space to the graph
-
-The detailed CPM graph uses Unicode Braille cells as a 2×4 sub-pixel matrix. Consecutive CPM samples are connected with Bresenham line rasterization in that sub-cell space, which gives slopes and transitions substantially more visual resolution than ordinary `•`, `│`, `╱`, and `╲` terminal glyphs. The graph retains its scaled Y axis, grid lines, average reference line, current/minimum/average/maximum statistics, and uses as many recent samples as fit across the terminal width. The polling buffer retains up to roughly ten minutes of samples.
 
 Color is semantic rather than decorative: cyan identifies radiation/data, yellow emphasizes the live CPM/latest graph point, green identifies healthy/confirmed states, yellow calls attention to caution or clock drift, red is reserved for failures and destructive/expert operations, and dark gray is used for secondary/unsupported information.
 
@@ -47,6 +59,32 @@ The original compact renderer is still included as a fallback during hardware te
 ```powershell
 dotnet run -c Release -- --classic
 ```
+
+## JSON Lines / collector mode
+
+`--json` disables the TUI and writes **exactly one compact JSON object per successful CPM sample** to stdout. Diagnostics and read failures are written to stderr, so stdout can be safely redirected or appended to a `.jsonl` file.
+
+Windows PowerShell:
+
+```powershell
+dotnet run -c Release -- --port COM10 --baud 57600 --json >> radiation.jsonl
+```
+
+Linux:
+
+```bash
+dotnet run -c Release -- --port /dev/ttyUSB0 --baud 57600 --json >> radiation.jsonl
+```
+
+Each line contains fields such as:
+
+```json
+{"timestamp_utc":"2026-08-24T22:30:00.0000000Z","timestamp_local":"2026-08-24T17:30:00.0000000-05:00","cpm":15,"dose_uSv_h":0.0929,"dose_mR_h":0.00929,"battery_v":4.0,"device_time":"2026-08-24T17:29:59","device_clock_drift_s":-1.2,"speaker":false,"alarm":false,"logging_mode":"Every second / CPS (1)","version":"GMC-300SRe 1.05","serial":"F7F4C51605DD3C","port":"COM10","baud":57600}
+```
+
+CPM is sampled about once per second. Battery voltage and device clock are refreshed approximately every five seconds; configuration-derived state is refreshed approximately every thirty seconds and carried forward into intervening samples.
+
+This mode is intended to become the basis of a long-running Linux collector/service, MQTT bridge, database logger, or other headless integration.
 
 ## Important safety note about settings
 
@@ -63,20 +101,28 @@ Every EEPROM edit makes a backup first. The Info screen always shows all 256 raw
 
 ## Build
 
-Install the current .NET 8 SDK for Windows, then from this folder:
+Install the current .NET 8 SDK, then from this folder:
 
-```powershell
+```text
 dotnet restore
 dotnet build -c Release
 ```
 
-Run directly:
+Run directly on Windows:
 
 ```powershell
 dotnet run -c Release -- --port COM10 --baud 57600
 ```
 
-Or publish a self-contained Windows x64 executable:
+Run on Linux:
+
+```bash
+dotnet run -c Release -- --port /dev/ttyUSB0 --baud 57600
+```
+
+The defaults are **COM10** on Windows, **`/dev/ttyUSB0`** on Linux, and **57600 baud** on both. Some Linux systems may expose the counter as `/dev/ttyACM0` or another tty device instead. Linux users may also need appropriate serial-device permissions (commonly membership in the `dialout` group).
+
+Publish a self-contained Windows x64 executable:
 
 ```powershell
 dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
@@ -85,10 +131,14 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 The executable will be under:
 
 ```text
-bin\Release\net8.0-windows\win-x64\publish\gmc300s-tui.exe
+bin\Release\net8.0\win-x64\publish\gmc300s-tui.exe
 ```
 
-The defaults are already **COM10** and **57600 baud**, matching the counter used while this project was created.
+A Linux x64 publish can similarly be produced with:
+
+```bash
+dotnet publish -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true
+```
 
 ## Keyboard
 
@@ -104,7 +154,7 @@ Global keys:
 | `X` | Advanced commands |
 | `M` | Speaker/click toggle |
 | `A` | Alarm toggle |
-| `T` | Sync counter clock to Windows |
+| `T` | Sync counter clock to host |
 | `F1` | Help |
 | `Q` / `Ctrl+C` | Quit |
 
@@ -119,15 +169,10 @@ Remote keypad:
 
 ## Files created by the program
 
-Configuration backups:
+Configuration backups and history exports are placed beneath the operating system's local application-data directory. On Windows this is typically:
 
 ```text
 %LOCALAPPDATA%\Gmc300sTui\config-backups
-```
-
-History exports:
-
-```text
 %LOCALAPPDATA%\Gmc300sTui\history
 ```
 
@@ -163,7 +208,7 @@ Unknown models default to the same conservative optional-feature set until verif
 
 ## Build validation
 
-A Windows GitHub Actions workflow restores and builds the project with .NET 8 on pushes and pull requests to `main`.
+GitHub Actions restores and builds the project with .NET 8 on both **Windows** and **Ubuntu Linux** for pushes and pull requests to `main`.
 
 ## History parsing
 
