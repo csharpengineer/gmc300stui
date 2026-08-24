@@ -288,6 +288,16 @@ internal static class GraphGraphics
             Console.Write($"\u001b[{topRow + 1};{minCellX + 1}H");
             Console.Write(sixel);
             Console.Write("\u001b8");
+
+            // ResponsiveTuiApp deliberately leaves one terminal column and one
+            // row unused so writing a character into the bottom-right cell can
+            // never trigger an implicit wrap/scroll. Windows Terminal may reflow
+            // old cells into those untouched margins during a resize, leaving
+            // random-looking letters along the right/bottom edges. ECH/EL erase
+            // cells without advancing the cursor, so we can clean those margins
+            // without ever writing into the dangerous bottom-right cell.
+            EraseReservedTerminalMargins();
+
             _lastSixelSignature = signature;
         }
         catch
@@ -296,6 +306,37 @@ internal static class GraphGraphics
             // Sixel off for the rest of this process; the next frame uses Braille.
             _sixelFailed = true;
             _lastSixelSignature = null;
+        }
+    }
+
+    private static void EraseReservedTerminalMargins()
+    {
+        if (Console.IsOutputRedirected)
+            return;
+
+        try
+        {
+            var width = Console.WindowWidth;
+            var height = Console.WindowHeight;
+            if (width < 1 || height < 1)
+                return;
+
+            Console.Write("\u001b7");
+
+            // Erase the reserved rightmost cell of every row except the final row.
+            // CSI X (ECH) removes a cell but does not move the cursor or wrap.
+            for (var row = 1; row < height; row++)
+                Console.Write($"\u001b[{row};{width}H\u001b[1X");
+
+            // Erase the entire reserved bottom row. CSI 2 K (EL) does not advance
+            // the cursor, so clearing this row cannot scroll the terminal.
+            Console.Write($"\u001b[{height};1H\u001b[2K");
+            Console.Write("\u001b8");
+        }
+        catch
+        {
+            // A resize can race these WindowWidth/WindowHeight reads. The next
+            // successful graph update will clean the margins again.
         }
     }
 
