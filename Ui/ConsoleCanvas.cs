@@ -17,7 +17,17 @@ internal sealed class ConsoleCanvas
     private readonly bool[,] _brailleActive;
     private (int CellX, int SubX, int SubY)? _lastBrailleGraphPoint;
 
+    // DrawCpmGraph writes its scale labels immediately before its cyan data
+    // points. Capture those labels so a point that was rounded to a terminal row
+    // can be reconstructed to its integer CPM value and then positioned using
+    // the full four Braille sub-rows in that cell. This keeps the existing graph
+    // API simple while giving the detailed plot true sub-cell Y resolution.
+    private bool _capturingGraphScale;
+    private readonly List<(int Row, int Value)> _graphScaleLabels = new(3);
+    private GraphScale? _brailleGraphScale;
+
     private readonly record struct Cell(char Ch, ConsoleColor Foreground, ConsoleColor Background);
+    private readonly record struct GraphScale(int TopRow, int BottomRow, int MinValue, int MaxValue);
 
     public ConsoleCanvas(int width, int height)
     {
@@ -42,6 +52,9 @@ internal sealed class ConsoleCanvas
         Array.Clear(_brailleMasks, 0, _brailleMasks.Length);
         Array.Clear(_brailleActive, 0, _brailleActive.Length);
         _lastBrailleGraphPoint = null;
+        _capturingGraphScale = false;
+        _graphScaleLabels.Clear();
+        _brailleGraphScale = null;
     }
 
     public void Fill(int x, int y, int width, int height, char ch = ' ',
@@ -115,6 +128,8 @@ internal sealed class ConsoleCanvas
         ConsoleColor background = ConsoleColor.Black)
     {
         if (string.IsNullOrEmpty(text)) return;
+
+        ObserveGraphScaleLabel(y, text);
         Write(rightX - text.Length + 1, y, text, foreground, background);
     }
 
@@ -161,6 +176,38 @@ internal sealed class ConsoleCanvas
         }
     }
 
+    private void ObserveGraphScaleLabel(int y, string text)
+    {
+        // The detailed graph's statistics string is unique enough to delimit a
+        // new scale-capture sequence without coupling the canvas to screen
+        // coordinates. DrawCpmGraph then writes top/middle/bottom integer labels.
+        if (text.StartsWith("now ", StringComparison.Ordinal) &&
+            text.Contains(" samples", StringComparison.Ordinal))
+        {
+            _capturingGraphScale = true;
+            _graphScaleLabels.Clear();
+            _brailleGraphScale = null;
+            _lastBrailleGraphPoint = null;
+            return;
+        }
+
+        if (!_capturingGraphScale ||
+            !int.TryParse(text, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var value))
+            return;
+
+        _graphScaleLabels.Add((y, value));
+        if (_graphScaleLabels.Count < 3)
+            return;
+
+        var top = _graphScaleLabels[0];
+        var bottom = _graphScaleLabels[2];
+        if (bottom.Row > top.Row && top.Value > bottom.Value)
+            _brailleGraphScale = new GraphScale(top.Row, bottom.Row, bottom.Value, top.Value);
+
+        _capturingGraphScale = false;
+    }
+
     private static bool IsBrailleGraphPoint(char ch, ConsoleColor foreground) =>
         ch is '•' or '●' && foreground is ConsoleColor.Cyan or ConsoleColor.Yellow;
 
@@ -169,11 +216,8 @@ internal sealed class ConsoleCanvas
 
     private void PlotBrailleGraphPoint(int cellX, int cellY, ConsoleColor pointColor)
     {
-        // Put the logical point near the center of its terminal cell. Consecutive
-        // cell centers are two Braille sub-pixels apart horizontally and four apart
-        // vertically, giving Bresenham enough resolution for visible slopes.
         var subX = cellX * 2 + 1;
-        var subY = cellY * 4 + 2;
+        var subY = GetFullResolutionGraphSubY(cellY);
 
         if (_lastBrailleGraphPoint is { } previous)
         {
@@ -190,6 +234,40 @@ internal sealed class ConsoleCanvas
 
         SetBrailleDot(subX, subY, pointColor);
         _lastBrailleGraphPoint = (cellX, subX, subY);
+    }
+
+    private int GetFullResolutionGraphSubY(int cellY)
+    {
+        if (_brailleGraphScale is not { } scale ||
+            cellY < scale.TopRow || cellY > scale.BottomRow ||
+            scale.MaxValue <= scale.MinValue)
+        {
+            return cellY * 4 + 2;
+        }
+
+        // ValueToRow in ResponsiveTuiApp rounds an integer CPM value to the
+        // nearest terminal row. In the normal background-radiation ranges there
+        // are more plot rows than distinct CPM values, so this inversion recovers
+        // that integer value exactly. We then map the recovered value over every
+        // Braille sub-row instead of snapping it back to the cell center.
+        var rowSpan = scale.BottomRow - scale.TopRow;
+        var rowFromBottom = scale.BottomRow - cellY;
+        var approximateValue = scale.MinValue +
+            rowFromBottom / (double)rowSpan * (scale.MaxValue - scale.MinValue);
+        var cpm = Math.Clamp(
+            (int)Math.Round(approximateValue, MidpointRounding.AwayFromZero),
+            scale.MinValue,
+            scale.MaxValue);
+
+        // Stay slightly inside the top/bottom terminal rows so the series does
+        // not visually collide with the graph frame while still using essentially
+        // all four sub-rows per cell.
+        var topSubY = scale.TopRow * 4 + 1;
+        var bottomSubY = scale.BottomRow * 4 + 2;
+        var fraction = (cpm - scale.MinValue) / (double)(scale.MaxValue - scale.MinValue);
+        return bottomSubY - (int)Math.Round(
+            fraction * (bottomSubY - topSubY),
+            MidpointRounding.AwayFromZero);
     }
 
     private void PlotBrailleLine(int x0, int y0, int x1, int y1, ConsoleColor color)
