@@ -12,8 +12,8 @@ namespace Gmc300sTui;
 internal sealed class JsonLineRunner
 {
     private readonly Gmc300sDevice _device;
-    private string _version = string.Empty;
-    private string _serial = string.Empty;
+    private string _version = "unknown";
+    private string _serial = "unknown";
     private byte[]? _config;
     private double? _voltage;
     private DateTime? _deviceTime;
@@ -28,9 +28,12 @@ internal sealed class JsonLineRunner
 
     public void Run()
     {
-        _version = SafeRead(_device.GetVersion) ?? "unknown";
-        _serial = SafeRead(_device.GetSerialNumber) ?? "unknown";
-        _config = SafeRead(_device.GetConfig);
+        if (TryRead(_device.GetVersion, out string version))
+            _version = version;
+        if (TryRead(_device.GetSerialNumber, out string serial))
+            _serial = serial;
+        if (TryRead(_device.GetConfig, out byte[] config))
+            _config = config;
         PollSlow(force: true);
 
         using var cts = new CancellationTokenSource();
@@ -77,15 +80,13 @@ internal sealed class JsonLineRunner
             return;
         _lastSlowPoll = now;
 
-        var voltage = SafeRead(_device.GetVoltage);
-        if (voltage is not null)
+        if (TryRead(_device.GetVoltage, out double voltage))
             _voltage = voltage;
 
-        var deviceTime = SafeRead(_device.GetDateTime);
-        if (deviceTime is not null)
+        if (TryRead(_device.GetDateTime, out DateTime deviceTime))
         {
             _deviceTime = deviceTime;
-            _clockDriftSeconds = (deviceTime.Value - DateTime.Now).TotalSeconds;
+            _clockDriftSeconds = (deviceTime - DateTime.Now).TotalSeconds;
         }
     }
 
@@ -95,8 +96,7 @@ internal sealed class JsonLineRunner
         if ((now - _lastConfigPoll).TotalSeconds < 30)
             return;
         _lastConfigPoll = now;
-        var config = SafeRead(_device.GetConfig);
-        if (config is not null)
+        if (TryRead(_device.GetConfig, out byte[] config))
             _config = config;
     }
 
@@ -139,16 +139,18 @@ internal sealed class JsonLineRunner
         Console.Out.Flush();
     }
 
-    private static T? SafeRead<T>(Func<T> reader)
+    private static bool TryRead<T>(Func<T> reader, out T value)
     {
         try
         {
-            return reader();
+            value = reader();
+            return true;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"{DateTimeOffset.Now:O} device metadata read failed: {ex.Message}");
-            return default;
+            value = default!;
+            return false;
         }
     }
 
