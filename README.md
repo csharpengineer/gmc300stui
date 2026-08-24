@@ -6,11 +6,11 @@ It talks directly to the counter over its USB serial port; GQ's desktop software
 
 ## What it does
 
-- Live CPM dashboard with rolling sparkline
+- Live CPM dashboard with a one-minute rolling sparkline plus min/average/max
 - Dose-rate estimate (µSv/h and mR/h) using the counter's own three calibration points
 - Battery voltage
-- Device date/time and one-key clock synchronization
-- Temperature and gyroscope/orientation where the GMC-300S firmware responds to those commands
+- Device date/time, live PC clock-drift display, and one-key clock synchronization
+- Model capability table that prevents unsupported sensor commands from being shown as real readings
 - Device version and serial number
 - Speaker/click mute/unmute (`SPEAKER0` / `SPEAKER1`)
 - Alarm enable/disable (`ALARM0` / `ALARM1`)
@@ -116,16 +116,26 @@ History exports:
 
 ### Confirmed on the specific GMC-300S used here
 
-The following were tested manually before creating this project:
+The following were tested manually against a **GMC-300SRe 1.05** before and during development:
 
 - USB serial at 57600 baud on COM10
 - `<GETCPM>>`
 - `<SPEAKER0>>`
 - `SPEAKER0` returned `0xAA` and immediately stopped the physical clicks
+- battery voltage, RTC, configuration, serial number, alarm state, and logging mode reads
 
-## A note about temperature
+## GMC-300S capability handling
 
-`GETTEMP` is present on 300S units supported by PyGMC, but some units give odd initial values before stabilizing. The TUI treats it as optional and stops repeatedly probing if the command times out.
+The wider GQ protocol family contains commands such as heartbeat CPS streaming, `GETTEMP`, and `GETGYRO`, but a command existing in the family does not mean a GMC-300S has the corresponding sensor or returns meaningful data. On the tested GMC-300SRe 1.05, the apparent temperature and gyro values were bogus.
+
+The TUI therefore uses a model capability table. For GMC-300S it:
+
+- keeps heartbeat disabled during normal command/response polling so unsolicited CPS bytes cannot contaminate replies
+- displays CPS as unavailable rather than showing a misleading zero
+- does not poll `GETTEMP` or `GETGYRO`
+- explicitly marks temperature and orientation as unsupported
+
+Unknown models default to the same conservative optional-feature set until verified on hardware.
 
 ## History parsing
 
