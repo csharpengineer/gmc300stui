@@ -11,4 +11,4 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 
 Write-Host ''
 Write-Host 'Done:'
-Write-Host '  bin\Release\net8.0-windows\win-x64\publish\gmc300s-tui.exe'
+Write-Host '  bin\Release\net8.0\win-x64\publish\gmc300s-tui.exe'
