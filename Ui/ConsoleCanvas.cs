@@ -366,49 +366,116 @@ internal sealed class ConsoleCanvas
             baseCell.Background);
     }
 
+    private void RenderRows(int firstRow, int lastRow)
+    {
+        firstRow = Math.Clamp(firstRow, 0, Height - 1);
+        lastRow = Math.Clamp(lastRow, 0, Height - 1);
+        if (lastRow < firstRow)
+            return;
+
+        for (var y = firstRow; y <= lastRow; y++)
+        {
+            Console.SetCursorPosition(0, y);
+            var x = 0;
+            while (x < Width)
+            {
+                var cell = EffectiveCell(x, y);
+                var start = x;
+                x++;
+                while (x < Width)
+                {
+                    var next = EffectiveCell(x, y);
+                    if (next.Foreground != cell.Foreground || next.Background != cell.Background)
+                        break;
+                    x++;
+                }
+
+                Console.ForegroundColor = cell.Foreground;
+                Console.BackgroundColor = cell.Background;
+                var chars = new char[x - start];
+                for (var i = 0; i < chars.Length; i++)
+                    chars[i] = EffectiveCell(start + i, y).Ch;
+                Console.Write(chars);
+            }
+        }
+    }
+
     public void Render()
     {
         try
         {
             Console.CursorVisible = false;
-            for (var y = 0; y < Height; y++)
-            {
-                Console.SetCursorPosition(0, y);
-                var x = 0;
-                while (x < Width)
-                {
-                    var cell = EffectiveCell(x, y);
-                    var start = x;
-                    x++;
-                    while (x < Width)
-                    {
-                        var next = EffectiveCell(x, y);
-                        if (next.Foreground != cell.Foreground || next.Background != cell.Background)
-                            break;
-                        x++;
-                    }
 
-                    Console.ForegroundColor = cell.Foreground;
-                    Console.BackgroundColor = cell.Background;
-                    var chars = new char[x - start];
-                    for (var i = 0; i < chars.Length; i++)
-                        chars[i] = EffectiveCell(start + i, y).Ch;
-                    Console.Write(chars);
+            // Console.Clear() and several host operations place the cursor at 0,0.
+            // If that happened outside this canvas, the terminal no longer contains
+            // our cached Sixel image even if the CPM geometry has not changed.
+            try
+            {
+                if (Console.CursorLeft == 0 && Console.CursorTop == 0)
+                    GraphGraphics.InvalidateSixelOverlay();
+            }
+            catch
+            {
+                // Cursor queries are only a best-effort invalidation hint.
+            }
+
+            if (GraphGraphics.UseSixel &&
+                _brailleGraphScale is { } scale &&
+                _sixelGraphPoints.Count >= 2)
+            {
+                var graphDirty = GraphGraphics.IsSixelOverlayDirty(
+                    _sixelGraphPoints, scale.TopRow, scale.BottomRow);
+
+                if (graphDirty)
+                {
+                    // Repaint the text underneath and replace the raster only when
+                    // the CPM data/scale actually changed (roughly once per second).
+                    // Synchronized output lets supporting terminals present that
+                    // clear+replacement as a single visual update.
+                    GraphGraphics.BeginSynchronizedUpdate();
+                    try
+                    {
+                        RenderRows(0, Height - 1);
+                        Console.ResetColor();
+                        GraphGraphics.RenderSixelOverlay(
+                            _sixelGraphPoints, scale.TopRow, scale.BottomRow);
+                    }
+                    finally
+                    {
+                        GraphGraphics.EndSynchronizedUpdate();
+                    }
+                }
+                else
+                {
+                    // A normal TUI frame arrives every 250 ms. Do not write spaces
+                    // or grid characters through the rows occupied by the persistent
+                    // Sixel image; doing so makes Windows Terminal erase the raster.
+                    if (scale.TopRow > 0)
+                        RenderRows(0, scale.TopRow - 1);
+                    if (scale.BottomRow < Height - 1)
+                        RenderRows(scale.BottomRow + 1, Height - 1);
+                    Console.ResetColor();
                 }
             }
-            Console.ResetColor();
-
-            if (GraphGraphics.UseSixel && _brailleGraphScale is { } scale)
-                GraphGraphics.RenderSixelOverlay(_sixelGraphPoints, scale.TopRow, scale.BottomRow);
+            else
+            {
+                // Screens without a Sixel graph overwrite the whole terminal, so
+                // returning to the dashboard must force a fresh raster image.
+                GraphGraphics.InvalidateSixelOverlay();
+                RenderRows(0, Height - 1);
+                Console.ResetColor();
+            }
         }
         catch (ArgumentOutOfRangeException)
         {
             // The user resized the terminal between measuring it and rendering.
             // The next frame will use the new dimensions.
+            GraphGraphics.InvalidateSixelOverlay();
         }
         catch (IOException)
         {
             // Console host changed/disconnected during a frame. A later frame can retry.
+            GraphGraphics.InvalidateSixelOverlay();
         }
     }
 }
